@@ -7,3 +7,7 @@ __pycache__/
 .env
 .DS_Store
 graphify-out/
+
+# AI tooling — never committed (house rule)
+AGENTS.md
+.kimi-code/

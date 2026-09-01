@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+# Default PyPI torch wheels for Linux are CUDA-enabled (cu124); on hosts
+# without a GPU they fall back to CPU at runtime.
+torch==2.5.1
+transformers==4.46.3
+huggingface-hub==0.26.3
+numpy==2.1.3
+noisereduce==3.0.3
+phonemizer==3.3.0
+panphon==0.20.0
