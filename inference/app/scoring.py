@@ -28,10 +28,25 @@ import unicodedata
 from functools import lru_cache
 
 import panphon.distance
+import panphon.featuretable
 from phonemizer import phonemize
 from phonemizer.separator import Separator
 
 _dist = panphon.distance.Distance()
+_ft = panphon.featuretable.FeatureTable()
+
+
+@lru_cache(maxsize=None)
+def _is_vocalic(tok: str) -> bool:
+    """True if every phone in the token is syllabic (a vowel/diphthong).
+    Used to reject vowel soup: hums, breaths, and mic noise transcribe as
+    near-pure vowel runs, while real speech is consonant-rich."""
+    phones = _ft.ipa_segs(tok)
+    if not phones:
+        return False
+    return all(
+        (p := _ft.fts(phone)) and p.match({"syl": 1}) for phone in phones
+    )
 
 # phone="|" makes the espeak backend emit one "|"-separated token per phoneme
 # (phonemizer requires word/phone separators to differ, so not a plain space),
@@ -244,6 +259,11 @@ def locate_window(
     actual_tokens = normalize_ipa(actual_ipa).split()
     if len(actual_tokens) < 3:
         return -1
+    # Vowel-soup guard: humming/breathing/mic noise transcribes as near-pure
+    # vowels and would otherwise schwa-match its way forward through the text.
+    vocalic = sum(1 for t in actual_tokens if _is_vocalic(t))
+    if vocalic / len(actual_tokens) > 0.7:
+        return -1
 
     from_word = max(0, min(from_word, len(words) - 1))
     lo = sum(len(t) for t in word_tokens[:from_word])
@@ -274,11 +294,12 @@ def locate_window(
             best_v, best_i = cur[m], i
         prev = cur
 
-    # Reject noise: measured on this pipeline, real speech (even with every
-    # vowel wrong) aligns at ~0.12 cost/token, accented speech ~0.02, while
-    # random-phoneme noise lands ~0.26. 0.20 separates them; the monotonic
-    # backend clamp and per-chunk prefix realignment bound residual errors.
-    if best_i <= lo or best_v > 0.20 * m:
+    # Reject noise: measured on this pipeline — TTS speech windows align at
+    # ~0.15-0.19 cost/token, clean synthetic speech ~0.02-0.12, random-phoneme
+    # noise ~0.26. Real (denoised) white noise transcribes to empty and never
+    # reaches here; hums/breaths are caught by the vowel-soup guard above.
+    # Threshold errs toward accepting accented speech over rejecting noise.
+    if best_i <= lo or best_v > 0.30 * m:
         return -1
 
     owner: list[int] = []

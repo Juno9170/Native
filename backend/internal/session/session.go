@@ -354,11 +354,9 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 			cumulative.WriteString(ipa)
 			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
 				s.log.Warn("align failed", "err", err)
-			} else if idx >= 0 {
-				// The cumulative transcript is the source of truth: chunks may
-				// correct a peek that overshot on noise, so assign (the
-				// client applies partial wordIndex absolutely, progress as a
-				// lower bound).
+			} else if idx > lastIdx {
+				// Monotonic everywhere: letting chunks pull the position back
+				// made the strip visibly ping-pong against peeks.
 				lastIdx = idx
 				msg.WordIndex = &idx
 			}
