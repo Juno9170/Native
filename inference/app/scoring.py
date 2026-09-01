@@ -274,10 +274,14 @@ def locate_window(
     # Local alignment over expected[lo:hi]: dp rows = expected tokens, cols =
     # actual tokens; cur[0] = 0 lets the matched region start anywhere in the
     # band; the answer is the best final column over band rows, ties toward
-    # the earlier end.
+    # the earlier end. A short window's few phonemes can cheaply match MANY
+    # places in the band, so region selection adds a small drift penalty per
+    # token of distance from the band start (0.02/token ≈ one phoneme
+    # mismatch per 5 words) — enough to anchor the reader near the current
+    # position, far too small to override a genuine match.
     m = len(actual_tokens)
     prev = [float(j) for j in range(m + 1)]  # virtual row before the band
-    best_i, best_v = lo, float("inf")
+    best_i, best_sel, best_raw = lo, float("inf"), float("inf")
     for i in range(lo + 1, hi + 1):
         cur = [0.0] + [0.0] * m
         ei = expected_tokens[i - 1]
@@ -290,8 +294,9 @@ def locate_window(
                 if c2 < c:
                     c = c2
             cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
-        if cur[m] < best_v:
-            best_v, best_i = cur[m], i
+        sel = cur[m] + 0.02 * (i - lo)
+        if sel < best_sel:
+            best_sel, best_i, best_raw = sel, i, cur[m]
         prev = cur
 
     # Reject noise: measured on this pipeline — TTS speech windows align at
@@ -299,7 +304,7 @@ def locate_window(
     # noise ~0.26. Real (denoised) white noise transcribes to empty and never
     # reaches here; hums/breaths are caught by the vowel-soup guard above.
     # Threshold errs toward accepting accented speech over rejecting noise.
-    if best_i <= lo or best_v > 0.30 * m:
+    if best_i <= lo or best_raw > 0.30 * m:
         return -1
 
     owner: list[int] = []

@@ -70,9 +70,14 @@ type progressMessage struct {
 
 // job is one unit of inference work: a scored chunk (appended to the
 // cumulative transcript) or a peek (trailing window, reader position only).
+// whole marks peeks whose window covers the entire recording so far
+// (recording shorter than peekWindow): those use prefix alignment, since
+// the window IS the full speech — local window alignment would let the
+// first word's few phonemes float to any cheap match in the band.
 type job struct {
-	pcm  []byte
-	peek bool
+	pcm   []byte
+	peek  bool
+	whole bool
 }
 
 type finalMessage struct {
@@ -195,10 +200,11 @@ readLoop:
 			} else if len(buf)-peekStart >= peekEvery {
 				// Reader peek: trailing window only, position update only.
 				start := len(buf) - peekWindow
+				whole := start <= 0
 				if start < 0 {
 					start = 0
 				}
-				if !s.enqueue(jobs, job{pcm: buf[start:], peek: true}) {
+				if !s.enqueue(jobs, job{pcm: buf[start:], peek: true, whole: whole}) {
 					break readLoop
 				}
 				peekStart = len(buf)
@@ -321,14 +327,18 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 				continue
 			}
 			// The window contains only the last few words spoken, so align it
-			// LOCALLY against a band around the current position — appending
-			// it to the cumulative transcript would duplicate the overlap and
-			// the lenient substitution costs would walk the reader forward
-			// into unsaid words.
-			from := max(0, lastIdx-3)
-			idx, err := s.infer.AlignWindow(s.ctx, text, ipa, from)
+			// LOCALLY against a band around the current position — except at
+			// the very start, where the window is the whole recording so far
+			// and prefix fitting is exactly right (and can't float forward).
+			var idx int
+			if j.whole {
+				idx, err = s.infer.Align(s.ctx, text, ipa)
+			} else {
+				from := max(0, lastIdx-3)
+				idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from)
+			}
 			if err != nil {
-				s.log.Warn("window align failed", "err", err)
+				s.log.Warn("peek align failed", "err", err)
 				continue
 			}
 			if idx > lastIdx {
