@@ -1,0 +1,9 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+*.exe
+.env
+.DS_Store
+graphify-out/
