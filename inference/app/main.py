@@ -65,11 +65,18 @@ def score_ep(req: ScoreRequest) -> dict:
 class AlignRequest(BaseModel):
     text: str
     actualIpa: str
+    # "prefix" (default): actual is the cumulative transcript; fitting
+    # alignment. "window": actual is a short trailing window; local alignment
+    # against the band of words starting at fromWord.
+    mode: str = "prefix"
+    fromWord: int = 0
 
 
 @app.post("/align")
 def align_ep(req: AlignRequest) -> dict:
     try:
+        if req.mode == "window":
+            return {"wordIndex": scoring.locate_window(req.text, req.actualIpa, req.fromWord)}
         return {"wordIndex": scoring.align_progress(req.text, req.actualIpa)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

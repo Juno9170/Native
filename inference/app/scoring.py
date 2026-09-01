@@ -224,6 +224,69 @@ def align_progress(text: str, actual_ipa: str) -> int:
     return owner[k - 1]
 
 
+def locate_window(
+    text: str, actual_ipa: str, from_word: int, span: int = 25
+) -> int:
+    """Reader position from a short trailing audio window (a "peek").
+
+    Unlike align_progress (prefix/fitting, for the cumulative transcript), the
+    window contains only the LAST few words spoken, so it is aligned LOCALLY
+    against the band of expected words [from_word, from_word + span): the
+    matched region may start anywhere in the band, and the answer is the END
+    of the best-matching region. Returns the 0-based word index, or -1 when
+    the match is too poor to trust (silence/noise hallucinations).
+
+    Raises ValueError if the text contains no scoreable words.
+    """
+    words, word_tokens, expected_tokens, alts = _expected_for(text)
+    if not words:
+        raise ValueError("text contains no scoreable words")
+    actual_tokens = normalize_ipa(actual_ipa).split()
+    if len(actual_tokens) < 3:
+        return -1
+
+    from_word = max(0, min(from_word, len(words) - 1))
+    lo = sum(len(t) for t in word_tokens[:from_word])
+    hi = sum(len(t) for t in word_tokens[: min(len(words), from_word + span)])
+    if hi <= lo:
+        return -1
+
+    # Local alignment over expected[lo:hi]: dp rows = expected tokens, cols =
+    # actual tokens; cur[0] = 0 lets the matched region start anywhere in the
+    # band; the answer is the best final column over band rows, ties toward
+    # the earlier end.
+    m = len(actual_tokens)
+    prev = [float(j) for j in range(m + 1)]  # virtual row before the band
+    best_i, best_v = lo, float("inf")
+    for i in range(lo + 1, hi + 1):
+        cur = [0.0] + [0.0] * m
+        ei = expected_tokens[i - 1]
+        ei_alts = alts.get(i - 1, ())
+        for j in range(1, m + 1):
+            a = actual_tokens[j - 1]
+            c = _subst_cost(ei, a)
+            for alt in ei_alts:
+                c2 = _subst_cost(alt, a)
+                if c2 < c:
+                    c = c2
+            cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
+        if cur[m] < best_v:
+            best_v, best_i = cur[m], i
+        prev = cur
+
+    # Reject noise: measured on this pipeline, real speech (even with every
+    # vowel wrong) aligns at ~0.12 cost/token, accented speech ~0.02, while
+    # random-phoneme noise lands ~0.26. 0.20 separates them; the monotonic
+    # backend clamp and per-chunk prefix realignment bound residual errors.
+    if best_i <= lo or best_v > 0.20 * m:
+        return -1
+
+    owner: list[int] = []
+    for wi, toks in enumerate(word_tokens):
+        owner.extend([wi] * len(toks))
+    return owner[best_i - 1]
+
+
 def score(text: str, actual_ipa: str) -> dict:
     """Score actual IPA against the expected IPA for `text`.
 

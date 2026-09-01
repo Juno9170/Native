@@ -301,6 +301,7 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
 	processed := 0
 	var cumulative strings.Builder
+	lastIdx := -1 // reader position; never moves backward
 	for j := range jobs {
 		ipa, err := s.infer.Transcribe(s.ctx, j.pcm)
 		if err != nil {
@@ -319,17 +320,19 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 			if ipa == "" {
 				continue
 			}
-			soFar := cumulative.String()
-			if soFar != "" {
-				soFar += " "
-			}
-			soFar += ipa
-			idx, err := s.infer.Align(s.ctx, text, soFar)
+			// The window contains only the last few words spoken, so align it
+			// LOCALLY against a band around the current position — appending
+			// it to the cumulative transcript would duplicate the overlap and
+			// the lenient substitution costs would walk the reader forward
+			// into unsaid words.
+			from := max(0, lastIdx-3)
+			idx, err := s.infer.AlignWindow(s.ctx, text, ipa, from)
 			if err != nil {
-				s.log.Warn("align failed", "err", err)
+				s.log.Warn("window align failed", "err", err)
 				continue
 			}
-			if idx >= 0 {
+			if idx > lastIdx {
+				lastIdx = idx
 				if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
 					return
 				}
@@ -352,6 +355,11 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
 				s.log.Warn("align failed", "err", err)
 			} else if idx >= 0 {
+				// The cumulative transcript is the source of truth: chunks may
+				// correct a peek that overshot on noise, so assign (the
+				// client applies partial wordIndex absolutely, progress as a
+				// lower bound).
+				lastIdx = idx
 				msg.WordIndex = &idx
 			}
 		}

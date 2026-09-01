@@ -127,17 +127,34 @@ func (c *Client) Score(ctx context.Context, text, actualIPA string) (*ScoreRespo
 	return &out, nil
 }
 
-// Align posts the reference text and the partial IPA so far to /align and
-// returns the index of the last matched word (-1 = nothing matched yet).
+// Align posts the reference text and IPA to /align (mode "prefix": actualIPA
+// is the cumulative transcript) and returns the last matched word index
+// (-1 = nothing matched yet).
 func (c *Client) Align(ctx context.Context, text, actualIPA string) (int, error) {
-	payload, err := json.Marshal(map[string]string{
+	return c.align(ctx, map[string]any{
 		"text":      text,
 		"actualIpa": actualIPA,
+		"mode":      "prefix",
 	})
+}
+
+// AlignWindow is mode "window": actualIPA is a short trailing window, aligned
+// locally against the band of words starting at fromWord.
+func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWord int) (int, error) {
+	return c.align(ctx, map[string]any{
+		"text":      text,
+		"actualIpa": actualIPA,
+		"mode":      "window",
+		"fromWord":  fromWord,
+	})
+}
+
+func (c *Client) align(ctx context.Context, payload map[string]any) (int, error) {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return -1, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/align", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/align", bytes.NewReader(body))
 	if err != nil {
 		return -1, err
 	}
@@ -149,8 +166,8 @@ func (c *Client) Align(ctx context.Context, text, actualIPA string) (int, error)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return -1, fmt.Errorf("inference /align returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return -1, fmt.Errorf("inference /align returned %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out struct {
 		WordIndex int `json:"wordIndex"`

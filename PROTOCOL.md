@@ -24,7 +24,7 @@ Server → client (all text frames, JSON):
 - `GET /health` → `{"status":"ok","device":"cuda"|"cpu","model":"facebook/wav2vec2-lv-60-espeak-cv-ft"}`
 - `POST /transcribe` — body: raw pcm16 bytes (`Content-Type: application/octet-stream`) → `{"ipa":"..."}`. IPA uses the espeak alphabet produced by the wav2vec2 model; words separated by spaces, phonemes may be space-separated.
 - `POST /score` — JSON `{"text":"the passage","actualIpa":"..."}` → `{"expectedIpa":"...","score":0.87,"words":[{"word":"hello","expected":"həloʊ","ipa":"həlo","score":0.9}]}`. Target dialect: General American (espeak-ng `en-us`). Distance: panphon feature edit distance, normalized to 0..1.
-- `POST /align` — JSON `{"text":"the passage","actualIpa":"<partial IPA so far>"}` → `{"wordIndex":4}`; `-1` when nothing has matched yet. Cheap (expected phonemes are cached per text); called once per partial chunk.
+- `POST /align` — JSON `{"text":"the passage","actualIpa":"...","mode":"prefix"|"window","fromWord":0}` → `{"wordIndex":4}`; `-1` when nothing trustworthy matched. `prefix` (default): actualIpa is the cumulative transcript, fitting alignment. `window`: actualIpa is a short trailing window (~3 s), aligned locally against the band of words `[fromWord, fromWord+25)`; returns the end of the best-matching region, `-1` if the match is too poor (silence/noise). Cheap (expected phonemes are cached per text); called per chunk and per peek.
 
 ## Processing strategy (backend)
 
