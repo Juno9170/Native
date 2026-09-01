@@ -40,6 +40,27 @@ _phone_sep = Separator(word=" ", syllable="", phone="|")
 _STRIP_RE = re.compile(r"[ˈˌ͜͡.]")
 _WORD_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")
 
+# Common English function words: espeak word-alone phonemization returns the
+# CITATION form ("a" -> eɪ, "to" -> tuː), but connected speech almost always
+# uses the REDUCED form (ə, tə). Both are correct; accept either at equal
+# cost, otherwise perfectly natural unstressed readings score near zero.
+# Values are alternate IPA token lists; only alternates with the same token
+# count as the word's canonical form are used (position-wise mapping).
+_FUNCTION_WORD_ALTS: dict[str, list[list[str]]] = {
+    "a": [["ə"]],
+    "an": [["ə", "n"]],
+    "the": [["ð", "iː"]],
+    "to": [["t", "ə"]],
+    "of": [["ə", "v"]],
+    "and": [["ə", "n", "d"]],
+    "you": [["j", "ə"]],
+    "are": [["ə", "ɹ"]],
+    "for": [["f", "ə"]],
+    "or": [["ə", "ɹ"]],
+    "your": [["j", "ə"]],
+    "was": [["w", "ə", "z"]],
+}
+
 
 def normalize_ipa(s: str) -> str:
     """Strip stress marks / tie bars / syllable breaks; collapse whitespace."""
@@ -63,15 +84,32 @@ def _subst_cost(a: str, b: str) -> float:
     return float(_dist.feature_edit_distance(a, b))
 
 
-def _align(expected: list[str], actual: list[str]) -> list[tuple[int | None, int | None]]:
+def _positional_cost(
+    i: int, expected: list[str], alts: dict[int, list[str]], actual_tok: str
+) -> float:
+    """Substitution cost at expected position i: min over the canonical token
+    and any registered function-word alternates at that position."""
+    c = _subst_cost(expected[i], actual_tok)
+    for alt in alts.get(i, ()):
+        c = min(c, _subst_cost(alt, actual_tok))
+        if c == 0.0:
+            break
+    return c
+
+
+def _align(
+    expected: list[str], actual: list[str], alts: dict[int, list[str]] | None = None
+) -> list[tuple[int | None, int | None]]:
     """Levenshtein-style DP alignment of phoneme token sequences.
 
-    Substitution cost is panphon feature edit distance; insertion/deletion
-    cost is 1. Returns a list of (expected_idx | None, actual_idx | None)
-    pairs in sequence order.
+    Substitution cost is panphon feature edit distance (minimized over
+    function-word alternates in `alts`); insertion/deletion cost is 1.
+    Returns a list of (expected_idx | None, actual_idx | None) pairs in
+    sequence order.
     """
+    alts = alts or {}
     n, m = len(expected), len(actual)
-    cost = [[_subst_cost(expected[i], actual[j]) for j in range(m)] for i in range(n)]
+    cost = [[_positional_cost(i, expected, alts, actual[j]) for j in range(m)] for i in range(n)]
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
         dp[i][0] = i
@@ -113,7 +151,18 @@ def score(text: str, actual_ipa: str) -> dict:
     expected_tokens = [t for toks in word_tokens for t in toks]
     actual_tokens = normalize_ipa(actual_ipa).split()
 
-    pairs = _align(expected_tokens, actual_tokens)
+    # Register function-word alternates position-wise (only when the
+    # alternate's token count matches the canonical form's).
+    alts: dict[int, list[str]] = {}
+    base = 0
+    for w, toks in zip(words, word_tokens):
+        for alt in _FUNCTION_WORD_ALTS.get(w.lower(), ()):
+            if len(alt) == len(toks):
+                for p, tok in enumerate(alt):
+                    alts.setdefault(base + p, []).append(tok)
+        base += len(toks)
+
+    pairs = _align(expected_tokens, actual_tokens, alts)
 
     # Partial runs: expected tokens past the last matched one are words the
     # user never reached (stopped early) — their deletions are free. Skipped
@@ -144,7 +193,7 @@ def score(text: str, actual_ipa: str) -> dict:
         if a is None:
             c = 1.0
         else:
-            c = _subst_cost(expected_tokens[e], actual_tokens[a])
+            c = _positional_cost(e, expected_tokens, alts, actual_tokens[a])
             word_actual[wi].append(actual_tokens[a])
         total_dist += c
         word_dist[wi] += c
