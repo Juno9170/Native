@@ -27,9 +27,10 @@ from phonemizer.separator import Separator
 
 _dist = panphon.distance.Distance()
 
-# phone=" " makes the espeak backend emit one space-separated token per
-# phoneme, which gives us clean tokens for alignment and token counts.
-_phone_sep = Separator(word=" ", syllable="", phone=" ")
+# phone="|" makes the espeak backend emit one "|"-separated token per phoneme
+# (phonemizer requires word/phone separators to differ, so not a plain space),
+# which gives us clean tokens for alignment and token counts.
+_phone_sep = Separator(word=" ", syllable="", phone="|")
 
 _STRIP_RE = re.compile(r"[ˈˌ͜͡.]")
 _WORD_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")
@@ -47,7 +48,8 @@ def _phonemize_word(word: str) -> list[str]:
     out = phonemize(
         word, language="en-us", backend="espeak", separator=_phone_sep, strip=True
     )
-    return normalize_ipa(out).split()
+    out = normalize_ipa(out)
+    return [tok for chunk in out.split() for tok in chunk.split("|") if tok]
 
 
 def _subst_cost(a: str, b: str) -> float:
