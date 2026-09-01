@@ -14,8 +14,13 @@ we strip from one side must be stripped from the other.
 Distance: panphon FeatureEditDistance at the phoneme-token level. Whole
 utterances are compared via a DP alignment whose substitution cost is the
 panphon feature edit distance between the two aligned tokens (indel cost 1).
-Scores are normalized to 0..1: score = 1 - dist / max(n_expected, n_actual, 1),
-clamped at 0, where 1 means identical.
+Scores are normalized to 0..1: score = 1 - dist / region, clamped at 0, where
+1 means identical.
+
+Partial runs: expected tokens past the last aligned one are unreached words
+(stopped early) and their deletions are free; `region` is max(tokens up to
+the last match, actual tokens, 1). Skipped words inside the reached region
+still cost. If nothing matched at all, the overall score is 0.
 """
 
 import re
@@ -110,6 +115,15 @@ def score(text: str, actual_ipa: str) -> dict:
 
     pairs = _align(expected_tokens, actual_tokens)
 
+    # Partial runs: expected tokens past the last matched one are words the
+    # user never reached (stopped early) — their deletions are free. Skipped
+    # words *within* the reached region still cost. The score denominator is
+    # the compared region, not the full passage.
+    last_matched = -1
+    for e, a in pairs:
+        if e is not None and a is not None:
+            last_matched = max(last_matched, e)
+
     # Expected-token index -> owning word index.
     owner: list[int] = []
     for wi, toks in enumerate(word_tokens):
@@ -124,6 +138,8 @@ def score(text: str, actual_ipa: str) -> dict:
             # attributed to any word (word boundaries are ambiguous there).
             total_dist += 1.0
             continue
+        if a is None and e > last_matched:
+            continue  # unreached word, free
         wi = owner[e]
         if a is None:
             c = 1.0
@@ -133,15 +149,20 @@ def score(text: str, actual_ipa: str) -> dict:
         total_dist += c
         word_dist[wi] += c
 
-    denom = max(len(expected_tokens), len(actual_tokens), 1)
-    overall = max(0.0, 1.0 - total_dist / denom)
+    denom = max(last_matched + 1, len(actual_tokens), 1)
+    # Nothing matched at all (silence, noise) -> 0, not a free 1.0.
+    overall = 0.0 if last_matched < 0 else max(0.0, 1.0 - total_dist / denom)
 
     out_words = []
     for w, toks, d, acts in zip(words, word_tokens, word_dist, word_actual):
-        # No aligned actual phonemes -> empty ipa and the deletion cost alone
-        # drives the word score to 0 (expected-length penalty).
-        wdenom = max(len(toks), len(acts), 1)
-        ws = max(0.0, 1.0 - d / wdenom)
+        # No aligned actual phonemes -> word not said (skipped mid-run or
+        # unreached): empty ipa, score 0. The UI styles empty ipa as
+        # "not attempted".
+        if not acts:
+            ws = 0.0
+        else:
+            wdenom = max(len(toks), len(acts), 1)
+            ws = max(0.0, 1.0 - d / wdenom)
         out_words.append(
             {
                 "word": w,

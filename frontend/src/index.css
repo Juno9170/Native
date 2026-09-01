@@ -479,6 +479,11 @@ h3 {
   background: var(--saddle);
 }
 
+.word-chip.na {
+  background: var(--stone);
+  opacity: 0.75;
+}
+
 .word-text {
   font-weight: 700;
 }
@@ -526,6 +531,10 @@ h3 {
 
 .legend-key.poor {
   background: var(--saddle);
+}
+
+.legend-key.na {
+  background: var(--stone);
 }
 
 .results .btn {
