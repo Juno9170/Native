@@ -64,7 +64,9 @@ export default function Home() {
           </span>
         </label>
         {busy ? (
-          <WordStrip words={wordList} currentIndex={wordIndex} />
+          // wordIndex = last word heard; the strip highlights the NEXT word
+          // to read, already-read words trail behind in stone.
+          <WordStrip words={wordList} currentIndex={wordIndex + 1} />
         ) : (
           <>
             <textarea
