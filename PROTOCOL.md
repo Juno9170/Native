@@ -16,6 +16,7 @@ Server → client (all text frames, JSON):
 - `{"type":"ready"}` — ack of `start`, safe to stream audio.
 - `{"type":"partial","ipa":"h ə l oʊ","processedSec":12.5,"wordIndex":4}` — interim transcription of a completed ~2.5 s chunk (appended chunk, not cumulative). `wordIndex` (optional) is the 0-based index of the last word matched in the speech so far, for the scrolling reader; omitted when alignment is unavailable or nothing has matched.
 - `{"type":"progress","wordIndex":6}` — reader-position update from a "peek": a trailing ~2.5 s window transcribed every ~0.33 s of new audio (denoise off, own worker, stale peeks dropped). Peeks are not part of the scored transcript; the frame carries no `ipa`. Monotonicity is the client's call (treat as a lower-bound hint).
+- `{"type":"finishing"}` — the server detected the last word of the passage and is ending the session automatically (≈0.7 s grace after detection). Client should stop the mic and show the scoring state; `final` follows. The client may still send `stop` first if the user finishes early or stops mid-passage.
 - `{"type":"final","ipa":"...","expectedIpa":"...","score":0.87,"words":[{"word":"hello","expected":"həloʊ","ipa":"həlo","score":0.9}]}` — full-utterance result. `score` is 0..1 (1 = perfect match). `words[].ipa` is the aligned actual segment (may be empty).
 - `{"type":"error","message":"..."}` — fatal for the session; client should reset UI.
 

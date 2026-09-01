@@ -148,6 +148,14 @@ export function usePronunciationSession() {
             setWordIndex((cur) => Math.max(cur, msg.wordIndex));
           }
           break;
+        case 'finishing':
+          // Server detected the last word and is wrapping up: stop the mic
+          // and show the scoring state; "final" arrives shortly.
+          stopTimer();
+          stoppedRef.current = true;
+          closeAudio();
+          setStatus('scoring');
+          break;
         case 'final':
           stopTimer();
           closeAudio();

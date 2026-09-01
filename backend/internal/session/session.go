@@ -147,6 +147,10 @@ type session struct {
 	// lastIdx is the reader position (last matched word), shared by the
 	// chunk and peek workers; only ever advances.
 	lastIdx atomic.Int32
+
+	wordCount  int
+	finishOnce sync.Once
+	autoStop   atomic.Bool
 }
 
 func (s *session) run() {
@@ -160,6 +164,7 @@ func (s *session) run() {
 		return
 	}
 	s.log.Info("session started", "words", len(strings.Fields(text)))
+	s.wordCount = len(strings.Fields(text))
 	if err := s.writeJSON(map[string]string{"type": "ready"}); err != nil {
 		return
 	}
@@ -191,6 +196,13 @@ readLoop:
 	for {
 		mt, data, err := s.conn.ReadMessage()
 		if err != nil {
+			if s.autoStop.Load() {
+				// autoFinish tripped the read deadline: the last word was
+				// detected and the grace period elapsed — finish exactly as
+				// if the client had sent "stop".
+				s.log.Info("auto-finished: last word detected")
+				break readLoop
+			}
 			if s.ctx.Err() == nil {
 				s.log.Info("client disconnected", "err", err)
 			}
@@ -321,7 +333,7 @@ func (s *session) awaitStart() (string, bool) {
 }
 
 // advanceIdx moves the reader position forward (never backward); reports
-// whether it moved.
+// whether it moved. Reaching the last word arms auto-finish.
 func (s *session) advanceIdx(idx int) bool {
 	for {
 		cur := s.lastIdx.Load()
@@ -329,9 +341,31 @@ func (s *session) advanceIdx(idx int) bool {
 			return false
 		}
 		if s.lastIdx.CompareAndSwap(cur, int32(idx)) {
+			if idx == s.wordCount-1 {
+				s.finishOnce.Do(func() { go s.autoFinish() })
+			}
 			return true
 		}
 	}
+}
+
+// autoFinish ends the session shortly after the last word is detected. The
+// word is already in the buffer (that's how it was detected); a short grace
+// period captures its tail, then we notify the client and interrupt the
+// read loop via the read deadline (a blocked ReadMessage can't otherwise be
+// interrupted without closing the conn, which we still need for "final").
+func (s *session) autoFinish() {
+	select {
+	case <-time.After(700 * time.Millisecond):
+	case <-s.ctx.Done():
+		return
+	}
+	s.log.Info("last word detected, finishing")
+	if err := s.writeJSON(map[string]string{"type": "finishing"}); err != nil {
+		return
+	}
+	s.autoStop.Store(true)
+	_ = s.conn.SetReadDeadline(time.Now())
 }
 
 // chunkWorker transcribes scored chunks in order, appends to the cumulative
