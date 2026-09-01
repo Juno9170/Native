@@ -28,14 +28,15 @@ const (
 	// chunkBytes is the unit streamed to /transcribe while recording: ~2.5 s.
 	chunkBytes = bytesPerSecond * 5 / 2
 
-	// Reader "peek" jobs: every peekEvery bytes of new audio (~0.5 s), the
-	// trailing peekWindow (~3 s) is transcribed solely to update the
-	// scrolling reader position. Peeks are not part of the scored transcript.
-	// wav2vec2 needs a multi-second window for accurate phonemes; 0.5 s
-	// cadence is near the physical floor (a word can't be recognized before
-	// it has been said).
-	peekEvery  = bytesPerSecond / 2
-	peekWindow = bytesPerSecond * 3
+	// Reader "peek" jobs: every peekEvery bytes of new audio (~0.33 s), the
+	// trailing peekWindow (~2.5 s) is transcribed (denoise off, low latency)
+	// solely to update the scrolling reader position. Peeks run in their own
+	// worker so they never queue behind scored chunks, and stale peeks are
+	// dropped. wav2vec2 needs a multi-second window for accurate phonemes;
+	// this cadence is near the physical floor (a word can't be recognized
+	// before it has been said).
+	peekEvery  = bytesPerSecond / 3
+	peekWindow = bytesPerSecond * 5 / 2
 
 	maxWords = 200
 
@@ -68,15 +69,19 @@ type progressMessage struct {
 	WordIndex int    `json:"wordIndex"`
 }
 
-// job is one unit of inference work: a scored chunk (appended to the
-// cumulative transcript) or a peek (trailing window, reader position only).
-// whole marks peeks whose window covers the entire recording so far
-// (recording shorter than peekWindow): those use prefix alignment, since
-// the window IS the full speech — local window alignment would let the
-// first word's few phonemes float to any cheap match in the band.
+// job is one unit of scored inference work: a chunk appended to the
+// cumulative transcript. Peeks travel on a separate channel (see peekJob).
 type job struct {
+	pcm []byte
+}
+
+// peekJob is a reader-position update: a trailing audio window. whole marks
+// peeks whose window covers the entire recording so far (recording shorter
+// than peekWindow): those use prefix alignment, since the window IS the full
+// speech — local window alignment would let the first word's few phonemes
+// float to any cheap match in the band.
+type peekJob struct {
 	pcm   []byte
-	peek  bool
 	whole bool
 }
 
@@ -126,6 +131,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cancel: cancel,
 		log:    slog.With("session", id, "remote", r.RemoteAddr),
 	}
+	s.lastIdx.Store(-1)
 	s.run()
 }
 
@@ -137,6 +143,10 @@ type session struct {
 	log    *slog.Logger
 
 	writeMu sync.Mutex
+
+	// lastIdx is the reader position (last matched word), shared by the
+	// chunk and peek workers; only ever advances.
+	lastIdx atomic.Int32
 }
 
 func (s *session) run() {
@@ -163,12 +173,15 @@ func (s *session) run() {
 		}
 	}()
 
-	// Inference jobs are serialized through one worker goroutine so chunks
-	// transcribe in order, while audio intake never blocks on inference.
+	// Chunk jobs are serialized through one worker goroutine so chunks
+	// transcribe in order; peeks run in a second worker so reader updates
+	// never queue behind them. Audio intake never blocks on inference.
 	jobs := make(chan job, jobQueueDepth)
+	peeks := make(chan peekJob, 2) // small: stale peeks are dropped, not queued
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go s.worker(jobs, &wg, text)
+	wg.Add(2)
+	go s.chunkWorker(jobs, &wg, text)
+	go s.peekWorker(peeks, &wg, text)
 
 	buf := make([]byte, 0, chunkBytes*2)
 	chunkStart := 0
@@ -199,13 +212,18 @@ readLoop:
 				peekStart = len(buf)
 			} else if len(buf)-peekStart >= peekEvery {
 				// Reader peek: trailing window only, position update only.
+				// Dropped (not queued) if the peek worker is behind — a stale
+				// window is worthless, the next one lands in ~0.33 s.
 				start := len(buf) - peekWindow
 				whole := start <= 0
 				if start < 0 {
 					start = 0
 				}
-				if !s.enqueue(jobs, job{pcm: buf[start:], peek: true, whole: whole}) {
-					break readLoop
+				cp := make([]byte, len(buf)-start)
+				copy(cp, buf[start:])
+				select {
+				case peeks <- peekJob{pcm: cp, whole: whole}:
+				default:
 				}
 				peekStart = len(buf)
 			}
@@ -221,9 +239,10 @@ readLoop:
 	}
 
 	if s.ctx.Err() != nil {
-		// Session was cancelled (disconnect or fatal error); worker exits
-		// on its own once its in-flight request observes the cancelled ctx.
+		// Session was cancelled (disconnect or fatal error); workers exit
+		// on their own once in-flight requests observe the cancelled ctx.
 		close(jobs)
+		close(peeks)
 		wg.Wait()
 		return
 	}
@@ -233,11 +252,13 @@ readLoop:
 	if len(buf) > chunkStart {
 		if !s.enqueue(jobs, job{pcm: buf[chunkStart:]}) {
 			close(jobs)
+			close(peeks)
 			wg.Wait()
 			return
 		}
 	}
 	close(jobs)
+	close(peeks)
 	wg.Wait()
 	if s.ctx.Err() != nil {
 		return
@@ -299,55 +320,35 @@ func (s *session) awaitStart() (string, bool) {
 	}
 }
 
-// worker processes inference jobs in order. Chunks append to the cumulative
-// transcript and emit partial frames; peeks (trailing windows) only update
-// the reader position via progress frames. Peek failures are non-fatal —
-// the reader just updates on the next one.
-func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
+// advanceIdx moves the reader position forward (never backward); reports
+// whether it moved.
+func (s *session) advanceIdx(idx int) bool {
+	for {
+		cur := s.lastIdx.Load()
+		if int32(idx) <= cur {
+			return false
+		}
+		if s.lastIdx.CompareAndSwap(cur, int32(idx)) {
+			return true
+		}
+	}
+}
+
+// chunkWorker transcribes scored chunks in order, appends to the cumulative
+// transcript, and emits partial frames. Transcription failure is fatal.
+func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
 	processed := 0
 	var cumulative strings.Builder
-	lastIdx := -1 // reader position; never moves backward
 	for j := range jobs {
 		ipa, err := s.infer.Transcribe(s.ctx, j.pcm)
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return // session already torn down
 			}
-			if j.peek {
-				s.log.Warn("peek transcription failed", "err", err)
-				continue
-			}
 			s.log.Error("chunk transcription failed", "err", err)
 			s.fail("transcription failed") // protocol: error is fatal
 			return
-		}
-		if j.peek {
-			if ipa == "" {
-				continue
-			}
-			// The window contains only the last few words spoken, so align it
-			// LOCALLY against a band around the current position — except at
-			// the very start, where the window is the whole recording so far
-			// and prefix fitting is exactly right (and can't float forward).
-			var idx int
-			if j.whole {
-				idx, err = s.infer.Align(s.ctx, text, ipa)
-			} else {
-				from := max(0, lastIdx-3)
-				idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from)
-			}
-			if err != nil {
-				s.log.Warn("peek align failed", "err", err)
-				continue
-			}
-			if idx > lastIdx {
-				lastIdx = idx
-				if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
-					return
-				}
-			}
-			continue
 		}
 		processed += len(j.pcm)
 		msg := partialMessage{
@@ -364,16 +365,53 @@ func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 			cumulative.WriteString(ipa)
 			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
 				s.log.Warn("align failed", "err", err)
-			} else if idx > lastIdx {
-				// Monotonic everywhere: letting chunks pull the position back
-				// made the strip visibly ping-pong against peeks.
-				lastIdx = idx
+			} else if s.advanceIdx(idx) {
 				msg.WordIndex = &idx
 			}
 		}
 		err = s.writeJSON(msg)
 		if err != nil {
 			return
+		}
+	}
+}
+
+// peekWorker transcribes trailing-window peeks (denoise off, low latency)
+// and emits progress frames when the reader position advances. Peek failures
+// are non-fatal — the reader just updates on the next one.
+func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text string) {
+	defer wg.Done()
+	for p := range peeks {
+		ipa, err := s.infer.TranscribeFast(s.ctx, p.pcm)
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return // session already torn down
+			}
+			s.log.Warn("peek transcription failed", "err", err)
+			continue
+		}
+		if ipa == "" {
+			continue
+		}
+		// The window contains only the last few words spoken, so align it
+		// LOCALLY against a band around the current position — except at the
+		// very start, where the window is the whole recording so far and
+		// prefix fitting is exactly right (and can't float forward).
+		var idx int
+		if p.whole {
+			idx, err = s.infer.Align(s.ctx, text, ipa)
+		} else {
+			from := int(max(0, s.lastIdx.Load()-3))
+			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from)
+		}
+		if err != nil {
+			s.log.Warn("peek align failed", "err", err)
+			continue
+		}
+		if s.advanceIdx(idx) {
+			if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
+				return
+			}
 		}
 	}
 }

@@ -27,13 +27,13 @@ def health() -> dict:
 
 
 @app.post("/transcribe")
-async def transcribe_ep(request: Request) -> dict:
+async def transcribe_ep(request: Request, denoise: bool | None = None) -> dict:
     body = await request.body()
     if len(body) % 2 != 0:
         raise HTTPException(
             status_code=400, detail="pcm16 payload must have an even byte count"
         )
-    return {"ipa": transcribe.transcribe_pcm16(body)}
+    return {"ipa": transcribe.transcribe_pcm16(body, denoise=denoise)}
 
 
 class ScoreRequest(BaseModel):

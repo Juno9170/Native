@@ -51,13 +51,18 @@ def _decode_chunk(audio: np.ndarray) -> str:
     return text.replace("|", " ").strip()
 
 
-def transcribe_pcm16(data: bytes) -> str:
-    """Raw pcm16 (s16le, 16 kHz, mono) bytes -> espeak-alphabet IPA string."""
+def transcribe_pcm16(data: bytes, denoise: bool | None = None) -> str:
+    """Raw pcm16 (s16le, 16 kHz, mono) bytes -> espeak-alphabet IPA string.
+
+    denoise overrides the DENOISE env default; reader peeks pass denoise=False
+    (position-finding doesn't need spectral gating, and it dominates peek
+    latency on CPU).
+    """
     samples = np.frombuffer(data, dtype="<i2")
     if samples.size < MIN_SAMPLES:
         return ""
     audio = samples.astype(np.float32) / 32768.0
-    if DENOISE:
+    if DENOISE if denoise is None else denoise:
         import noisereduce as nr
 
         audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE, stationary=False)

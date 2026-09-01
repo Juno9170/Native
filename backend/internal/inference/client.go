@@ -72,7 +72,17 @@ func (c *Client) Health(ctx context.Context) (*Health, error) {
 
 // Transcribe posts raw pcm16 bytes to /transcribe and returns the IPA string.
 func (c *Client) Transcribe(ctx context.Context, pcm []byte) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/transcribe", bytes.NewReader(pcm))
+	return c.transcribe(ctx, c.base+"/transcribe", pcm)
+}
+
+// TranscribeFast is Transcribe with denoising disabled — for reader peeks,
+// where latency matters more than noise robustness.
+func (c *Client) TranscribeFast(ctx context.Context, pcm []byte) (string, error) {
+	return c.transcribe(ctx, c.base+"/transcribe?denoise=0", pcm)
+}
+
+func (c *Client) transcribe(ctx context.Context, url string, pcm []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(pcm))
 	if err != nil {
 		return "", err
 	}
