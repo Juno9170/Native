@@ -583,3 +583,45 @@ h3 {
     font-size: 1.7rem;
   }
 }
+
+/* ---- Scrolling reader strip ---- */
+
+.word-strip {
+  overflow: hidden;
+  padding: 1.6rem 0;
+  margin: 0.4rem 0 0.8rem;
+  border-top: 2px dashed var(--sand);
+  border-bottom: 2px dashed var(--sand);
+  mask-image: linear-gradient(90deg, transparent, black 15%, black 85%, transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, black 15%, black 85%, transparent);
+}
+
+.word-strip-track {
+  display: flex;
+  gap: 1.4rem;
+  white-space: nowrap;
+  padding: 0 50%; /* lets the first and last word reach center */
+  width: max-content;
+}
+
+.strip-word {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  color: var(--ink);
+  transition:
+    color 0.35s var(--ease-natural),
+    transform 0.35s var(--ease-natural),
+    opacity 0.35s var(--ease-natural);
+}
+
+.strip-word.spoken {
+  color: var(--stone);
+  opacity: 0.65;
+}
+
+.strip-word.current {
+  color: var(--rust);
+  transform: scale(1.18);
+  text-decoration: underline dotted var(--terracotta) 2px;
+  text-underline-offset: 0.35em;
+}

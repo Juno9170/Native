@@ -49,6 +49,9 @@ type partialMessage struct {
 	Type         string  `json:"type"`
 	IPA          string  `json:"ipa"`
 	ProcessedSec float64 `json:"processedSec"`
+	// WordIndex is the last expected word matched by the speech so far
+	// (drives the scrolling reader); omitted when alignment is unavailable.
+	WordIndex *int `json:"wordIndex,omitempty"`
 }
 
 type finalMessage struct {
@@ -125,12 +128,21 @@ func (s *session) run() {
 		return
 	}
 
+	// Warm the inference text cache (espeak phonemization of the passage) so
+	// the first /align during recording doesn't stall for seconds on long
+	// passages. An empty IPA populates the cache and returns immediately.
+	go func() {
+		if _, err := s.infer.Align(s.ctx, text, ""); err != nil {
+			s.log.Warn("cache warm-up failed", "err", err)
+		}
+	}()
+
 	// Inference jobs are serialized through one worker goroutine so chunks
 	// transcribe in order, while audio intake never blocks on inference.
 	jobs := make(chan []byte, jobQueueDepth)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go s.worker(jobs, &wg)
+	go s.worker(jobs, &wg, text)
 
 	buf := make([]byte, 0, chunkBytes*2)
 	chunkStart := 0
@@ -249,9 +261,10 @@ func (s *session) awaitStart() (string, bool) {
 }
 
 // worker transcribes audio chunks in order and emits partial frames.
-func (s *session) worker(jobs <-chan []byte, wg *sync.WaitGroup) {
+func (s *session) worker(jobs <-chan []byte, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
 	processed := 0
+	var cumulative strings.Builder
 	for chunk := range jobs {
 		ipa, err := s.infer.Transcribe(s.ctx, chunk)
 		if err != nil {
@@ -263,11 +276,25 @@ func (s *session) worker(jobs <-chan []byte, wg *sync.WaitGroup) {
 			return
 		}
 		processed += len(chunk)
-		err = s.writeJSON(partialMessage{
+		msg := partialMessage{
 			Type:         "partial",
 			IPA:          ipa,
 			ProcessedSec: float64(processed) / bytesPerSecond,
-		})
+		}
+		// Reader progress: align the cumulative transcription against the
+		// passage. Non-fatal — a failed align just omits wordIndex.
+		if ipa != "" {
+			if cumulative.Len() > 0 {
+				cumulative.WriteString(" ")
+			}
+			cumulative.WriteString(ipa)
+			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
+				s.log.Warn("align failed", "err", err)
+			} else if idx >= 0 {
+				msg.WordIndex = &idx
+			}
+		}
+		err = s.writeJSON(msg)
 		if err != nil {
 			return
 		}

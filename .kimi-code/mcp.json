@@ -3,6 +3,11 @@
     "supermemory": {
       "url": "https://mcp.supermemory.ai/mcp",
       "bearerTokenEnvVar": "SUPERMEMORY_NATIVE_API_KEY"
+    },
+    "graphify": {
+      "command": "uv",
+      "args": ["run", "--with", "graphifyy[mcp]", "python", "-m", "graphify.serve", "graphify-out/graph.json"],
+      "enabled": false
     }
   }
 }

@@ -39,6 +39,7 @@ function wsUrl() {
 export function usePronunciationSession() {
   const [status, setStatus] = useState('idle');
   const [partials, setPartials] = useState([]);
+  const [wordIndex, setWordIndex] = useState(-1); // reader strip position
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [elapsed, setElapsed] = useState(0);
@@ -136,6 +137,9 @@ export function usePronunciationSession() {
         }
         case 'partial':
           setPartials((p) => [...p, msg]);
+          if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
+            setWordIndex((cur) => Math.max(cur, msg.wordIndex));
+          }
           break;
         case 'final':
           stopTimer();
@@ -159,6 +163,7 @@ export function usePronunciationSession() {
       setError(null);
       setResult(null);
       setPartials([]);
+      setWordIndex(-1);
       setElapsed(0);
       setStatus('connecting');
       readyRef.current = false;
@@ -254,11 +259,12 @@ export function usePronunciationSession() {
   const reset = useCallback(() => {
     cleanupAll();
     setPartials([]);
+    setWordIndex(-1);
     setResult(null);
     setError(null);
     setElapsed(0);
     setStatus('idle');
   }, [cleanupAll]);
 
-  return { status, partials, result, error, elapsed, start, stop, reset };
+  return { status, partials, wordIndex, result, error, elapsed, start, stop, reset };
 }

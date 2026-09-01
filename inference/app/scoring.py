@@ -25,6 +25,7 @@ still cost. If nothing matched at all, the overall score is 0.
 
 import re
 import unicodedata
+from functools import lru_cache
 
 import panphon.distance
 from phonemizer import phonemize
@@ -79,6 +80,13 @@ def _phonemize_word(word: str) -> list[str]:
 
 
 def _subst_cost(a: str, b: str) -> float:
+    # Memoized: the phoneme inventory is ~40 symbols, so the DP cost matrix
+    # (n*m cells) only ever needs ~1600 real panphon calls.
+    return _subst_cost_cached(a, b)
+
+
+@lru_cache(maxsize=None)
+def _subst_cost_cached(a: str, b: str) -> float:
     if a == b:
         return 0.0
     return float(_dist.feature_edit_distance(a, b))
@@ -138,18 +146,19 @@ def _align(
     return pairs
 
 
-def score(text: str, actual_ipa: str) -> dict:
-    """Score actual IPA against the expected IPA for `text`.
-
-    Raises ValueError if the text contains no scoreable words.
+def _expected_for(text: str) -> tuple[list[str], list[list[str]], list[str], dict[int, list[str]]]:
+    """Expected side for a passage: words, per-word tokens, flat tokens, and
+    positional function-word alternates. Cached (LRU, 32 passages) because the
+    reader's /align endpoint and the final /score share it.
     """
-    words = _WORD_RE.findall(text)
-    if not words:
-        raise ValueError("text contains no scoreable words")
+    return _expected_cached(text)
 
+
+@lru_cache(maxsize=32)
+def _expected_cached(text: str):
+    words = _WORD_RE.findall(text)
     word_tokens = [_phonemize_word(w) for w in words]
     expected_tokens = [t for toks in word_tokens for t in toks]
-    actual_tokens = normalize_ipa(actual_ipa).split()
 
     # Register function-word alternates position-wise (only when the
     # alternate's token count matches the canonical form's).
@@ -161,6 +170,69 @@ def score(text: str, actual_ipa: str) -> dict:
                 for p, tok in enumerate(alt):
                     alts.setdefault(base + p, []).append(tok)
         base += len(toks)
+    return words, word_tokens, expected_tokens, alts
+
+
+def _fit_prefix(expected: list[str], actual: list[str], alts: dict[int, list[str]]) -> int:
+    """Fitting (semi-global) alignment: the actual sequence is fully consumed
+    against a PREFIX of the expected sequence; trailing expected tokens are
+    free. Returns the prefix length k (in tokens). Ties resolve to the
+    smallest k — reading starts at the beginning of the passage, unlike
+    scoring, where the global alignment may tie-break late.
+    """
+    n, m = len(expected), len(actual)
+    if m == 0:
+        return 0
+    prev = [float(j) for j in range(m + 1)]
+    best_k, best_v = 0, prev[m]
+    for i in range(1, n + 1):
+        cur = [float(i)] + [0.0] * m
+        ei = expected[i - 1]
+        ei_alts = alts.get(i - 1, ())
+        for j in range(1, m + 1):
+            a = actual[j - 1]
+            c = _subst_cost(ei, a)
+            for alt in ei_alts:
+                c2 = _subst_cost(alt, a)
+                if c2 < c:
+                    c = c2
+            cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
+        if cur[m] < best_v:
+            best_v, best_k = cur[m], i
+        prev = cur
+    return best_k
+
+
+def align_progress(text: str, actual_ipa: str) -> int:
+    """0-based index of the last expected word matched by the speech so far;
+    -1 if nothing has matched yet. Used by the scrolling reader.
+
+    Raises ValueError if the text contains no scoreable words.
+    """
+    words, word_tokens, expected_tokens, alts = _expected_for(text)
+    if not words:
+        raise ValueError("text contains no scoreable words")
+    actual_tokens = normalize_ipa(actual_ipa).split()
+
+    k = _fit_prefix(expected_tokens, actual_tokens, alts)
+    if k == 0:
+        return -1
+
+    owner: list[int] = []
+    for wi, toks in enumerate(word_tokens):
+        owner.extend([wi] * len(toks))
+    return owner[k - 1]
+
+
+def score(text: str, actual_ipa: str) -> dict:
+    """Score actual IPA against the expected IPA for `text`.
+
+    Raises ValueError if the text contains no scoreable words.
+    """
+    words, word_tokens, expected_tokens, alts = _expected_for(text)
+    if not words:
+        raise ValueError("text contains no scoreable words")
+    actual_tokens = normalize_ipa(actual_ipa).split()
 
     pairs = _align(expected_tokens, actual_tokens, alts)
 

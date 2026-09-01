@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { usePronunciationSession } from '../hooks/usePronunciationSession.js';
 import Results from '../components/Results.jsx';
 import PartialFeed from '../components/PartialFeed.jsx';
+import WordStrip from '../components/WordStrip.jsx';
 
 const MAX_WORDS = 200;
 
@@ -18,10 +19,11 @@ function fmtElapsed(sec) {
 export default function Home() {
   const [text, setText] = useState('');
   const [warned, setWarned] = useState(false);
-  const { status, partials, result, error, elapsed, start, stop, reset } =
+  const { status, partials, wordIndex, result, error, elapsed, start, stop, reset } =
     usePronunciationSession();
 
   const words = useMemo(() => countWords(text), [text]);
+  const wordList = useMemo(() => text.trim().split(/\s+/).filter(Boolean), [text]);
   const canRecord = words >= 1 && words <= MAX_WORDS;
 
   const onTextChange = (e) => {
@@ -61,19 +63,24 @@ export default function Home() {
             {words}/{MAX_WORDS} words
           </span>
         </label>
-        <textarea
-          id="passage"
-          className="passage"
-          rows="6"
-          placeholder="Type or paste up to 200 words of English here…"
-          value={text}
-          onChange={onTextChange}
-          disabled={busy}
-        />
-        <p className="hint">
-          English only, please — {MAX_WORDS} words max.
-          {warned && <strong> That is over the {MAX_WORDS}-word limit.</strong>}
-        </p>
+        {busy ? (
+          <WordStrip words={wordList} currentIndex={wordIndex} />
+        ) : (
+          <>
+            <textarea
+              id="passage"
+              className="passage"
+              rows="6"
+              placeholder="Type or paste up to 200 words of English here…"
+              value={text}
+              onChange={onTextChange}
+            />
+            <p className="hint">
+              English only, please — {MAX_WORDS} words max.
+              {warned && <strong> That is over the {MAX_WORDS}-word limit.</strong>}
+            </p>
+          </>
+        )}
 
         {error && (
           <div className="error-box" role="alert">

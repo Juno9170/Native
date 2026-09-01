@@ -60,3 +60,16 @@ def score_ep(req: ScoreRequest) -> dict:
         return scoring.score(req.text, req.actualIpa)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class AlignRequest(BaseModel):
+    text: str
+    actualIpa: str
+
+
+@app.post("/align")
+def align_ep(req: AlignRequest) -> dict:
+    try:
+        return {"wordIndex": scoring.align_progress(req.text, req.actualIpa)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
