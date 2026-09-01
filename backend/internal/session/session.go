@@ -28,6 +28,15 @@ const (
 	// chunkBytes is the unit streamed to /transcribe while recording: ~2.5 s.
 	chunkBytes = bytesPerSecond * 5 / 2
 
+	// Reader "peek" jobs: every peekEvery bytes of new audio (~0.5 s), the
+	// trailing peekWindow (~3 s) is transcribed solely to update the
+	// scrolling reader position. Peeks are not part of the scored transcript.
+	// wav2vec2 needs a multi-second window for accurate phonemes; 0.5 s
+	// cadence is near the physical floor (a word can't be recognized before
+	// it has been said).
+	peekEvery  = bytesPerSecond / 2
+	peekWindow = bytesPerSecond * 3
+
 	maxWords = 200
 
 	// readLimit caps any single WebSocket message (audio frames are small;
@@ -52,6 +61,18 @@ type partialMessage struct {
 	// WordIndex is the last expected word matched by the speech so far
 	// (drives the scrolling reader); omitted when alignment is unavailable.
 	WordIndex *int `json:"wordIndex,omitempty"`
+}
+
+type progressMessage struct {
+	Type      string `json:"type"`
+	WordIndex int    `json:"wordIndex"`
+}
+
+// job is one unit of inference work: a scored chunk (appended to the
+// cumulative transcript) or a peek (trailing window, reader position only).
+type job struct {
+	pcm  []byte
+	peek bool
 }
 
 type finalMessage struct {
@@ -139,13 +160,14 @@ func (s *session) run() {
 
 	// Inference jobs are serialized through one worker goroutine so chunks
 	// transcribe in order, while audio intake never blocks on inference.
-	jobs := make(chan []byte, jobQueueDepth)
+	jobs := make(chan job, jobQueueDepth)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go s.worker(jobs, &wg, text)
 
 	buf := make([]byte, 0, chunkBytes*2)
 	chunkStart := 0
+	peekStart := 0
 
 readLoop:
 	for {
@@ -165,10 +187,21 @@ readLoop:
 			}
 			buf = append(buf, data...)
 			if len(buf)-chunkStart >= chunkBytes {
-				if !s.enqueue(jobs, buf[chunkStart:]) {
+				if !s.enqueue(jobs, job{pcm: buf[chunkStart:]}) {
 					break readLoop
 				}
 				chunkStart = len(buf)
+				peekStart = len(buf)
+			} else if len(buf)-peekStart >= peekEvery {
+				// Reader peek: trailing window only, position update only.
+				start := len(buf) - peekWindow
+				if start < 0 {
+					start = 0
+				}
+				if !s.enqueue(jobs, job{pcm: buf[start:], peek: true}) {
+					break readLoop
+				}
+				peekStart = len(buf)
 			}
 		case websocket.TextMessage:
 			var m clientMessage
@@ -192,7 +225,7 @@ readLoop:
 	// Enqueue the remaining tail, then wait for all partial jobs to finish
 	// before the final full-utterance pass.
 	if len(buf) > chunkStart {
-		if !s.enqueue(jobs, buf[chunkStart:]) {
+		if !s.enqueue(jobs, job{pcm: buf[chunkStart:]}) {
 			close(jobs)
 			wg.Wait()
 			return
@@ -260,22 +293,50 @@ func (s *session) awaitStart() (string, bool) {
 	}
 }
 
-// worker transcribes audio chunks in order and emits partial frames.
-func (s *session) worker(jobs <-chan []byte, wg *sync.WaitGroup, text string) {
+// worker processes inference jobs in order. Chunks append to the cumulative
+// transcript and emit partial frames; peeks (trailing windows) only update
+// the reader position via progress frames. Peek failures are non-fatal —
+// the reader just updates on the next one.
+func (s *session) worker(jobs <-chan job, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
 	processed := 0
 	var cumulative strings.Builder
-	for chunk := range jobs {
-		ipa, err := s.infer.Transcribe(s.ctx, chunk)
+	for j := range jobs {
+		ipa, err := s.infer.Transcribe(s.ctx, j.pcm)
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return // session already torn down
+			}
+			if j.peek {
+				s.log.Warn("peek transcription failed", "err", err)
+				continue
 			}
 			s.log.Error("chunk transcription failed", "err", err)
 			s.fail("transcription failed") // protocol: error is fatal
 			return
 		}
-		processed += len(chunk)
+		if j.peek {
+			if ipa == "" {
+				continue
+			}
+			soFar := cumulative.String()
+			if soFar != "" {
+				soFar += " "
+			}
+			soFar += ipa
+			idx, err := s.infer.Align(s.ctx, text, soFar)
+			if err != nil {
+				s.log.Warn("align failed", "err", err)
+				continue
+			}
+			if idx >= 0 {
+				if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
+					return
+				}
+			}
+			continue
+		}
+		processed += len(j.pcm)
 		msg := partialMessage{
 			Type:         "partial",
 			IPA:          ipa,
@@ -301,13 +362,14 @@ func (s *session) worker(jobs <-chan []byte, wg *sync.WaitGroup, text string) {
 	}
 }
 
-// enqueue hands a copy of the chunk to the worker; returns false if the
-// session was cancelled while the queue was full.
-func (s *session) enqueue(jobs chan<- []byte, chunk []byte) bool {
-	cp := make([]byte, len(chunk))
-	copy(cp, chunk)
+// enqueue hands a copy of the job's audio to the worker; returns false if
+// the session was cancelled while the queue was full.
+func (s *session) enqueue(jobs chan<- job, j job) bool {
+	cp := make([]byte, len(j.pcm))
+	copy(cp, j.pcm)
+	j.pcm = cp
 	select {
-	case jobs <- cp:
+	case jobs <- j:
 		return true
 	case <-s.ctx.Done():
 		return false

@@ -141,6 +141,11 @@ export function usePronunciationSession() {
             setWordIndex((cur) => Math.max(cur, msg.wordIndex));
           }
           break;
+        case 'progress':
+          if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
+            setWordIndex((cur) => Math.max(cur, msg.wordIndex));
+          }
+          break;
         case 'final':
           stopTimer();
           closeAudio();
