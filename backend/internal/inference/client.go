@@ -138,11 +138,12 @@ func (c *Client) Score(ctx context.Context, text, actualIPA string) (*ScoreRespo
 }
 
 // Align posts the reference text and IPA to /align (mode "prefix": actualIPA
-// is the cumulative transcript) and returns the last matched word index
-// (-1 = nothing matched yet). maxWord >= 0 hard-caps the answer — chunks
-// arrive every ~2.5 s, so the position can physically advance only so far
-// between them. Pass a negative maxWord for no cap.
-func (c *Client) Align(ctx context.Context, text, actualIPA string, maxWord int) (int, error) {
+// is the cumulative transcript) and returns the fractional reading progress
+// (word index + fraction of that word's phonemes reached; -1 = nothing
+// matched yet). maxWord >= 0 hard-caps the answer — chunks arrive every
+// ~2.5 s, so the position can physically advance only so far between them.
+// Pass a negative maxWord for no cap.
+func (c *Client) Align(ctx context.Context, text, actualIPA string, maxWord int) (float64, error) {
 	payload := map[string]any{
 		"text":      text,
 		"actualIpa": actualIPA,
@@ -157,7 +158,8 @@ func (c *Client) Align(ctx context.Context, text, actualIPA string, maxWord int)
 // AlignWindow is mode "window": actualIPA is a short trailing window, aligned
 // locally against the band of words starting at fromWord, never answering
 // beyond maxWord (a further match is always a duplicate-word coincidence).
-func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWord, maxWord int) (int, error) {
+// Returns fractional progress like Align.
+func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWord, maxWord int) (float64, error) {
 	return c.align(ctx, map[string]any{
 		"text":      text,
 		"actualIpa": actualIPA,
@@ -167,7 +169,7 @@ func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWo
 	})
 }
 
-func (c *Client) align(ctx context.Context, payload map[string]any) (int, error) {
+func (c *Client) align(ctx context.Context, payload map[string]any) (float64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return -1, err
@@ -188,7 +190,7 @@ func (c *Client) align(ctx context.Context, payload map[string]any) (int, error)
 		return -1, fmt.Errorf("inference /align returned %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out struct {
-		WordIndex int `json:"wordIndex"`
+		WordIndex float64 `json:"wordIndex"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return -1, fmt.Errorf("decoding /align response: %w", err)

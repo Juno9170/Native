@@ -64,9 +64,10 @@ export default function Home() {
           </span>
         </label>
         {busy ? (
-          // wordIndex = last word heard; the strip highlights the NEXT word
-          // to read, already-read words trail behind in stone.
-          <WordStrip words={wordList} currentIndex={wordIndex + 1} />
+          // wordIndex is fractional progress (12.5 = halfway through word
+          // 12): the strip highlights the word being read and slides
+          // continuously; already-read words trail behind in stone.
+          <WordStrip words={wordList} currentIndex={wordIndex} />
         ) : (
           <>
             <textarea

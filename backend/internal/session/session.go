@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -28,15 +29,15 @@ const (
 	// chunkBytes is the unit streamed to /transcribe while recording: ~2.5 s.
 	chunkBytes = bytesPerSecond * 5 / 2
 
-	// Reader "peek" jobs: every peekEvery bytes of new audio (~0.33 s), the
-	// trailing peekWindow (~2.5 s) is transcribed (denoise off, low latency)
+	// Reader "peek" jobs: every peekEvery bytes of new audio (~0.25 s), the
+	// trailing peekWindow (~2 s) is transcribed (denoise off, low latency)
 	// solely to update the scrolling reader position. Peeks run in their own
 	// worker so they never queue behind scored chunks, and stale peeks are
 	// dropped. wav2vec2 needs a multi-second window for accurate phonemes;
 	// this cadence is near the physical floor (a word can't be recognized
 	// before it has been said).
-	peekEvery  = bytesPerSecond / 3
-	peekWindow = bytesPerSecond * 5 / 2
+	peekEvery  = bytesPerSecond / 4
+	peekWindow = bytesPerSecond * 2
 
 	maxWords = 200
 
@@ -80,14 +81,15 @@ type partialMessage struct {
 	Type         string  `json:"type"`
 	IPA          string  `json:"ipa"`
 	ProcessedSec float64 `json:"processedSec"`
-	// WordIndex is the last expected word matched by the speech so far
-	// (drives the scrolling reader); omitted when alignment is unavailable.
-	WordIndex *int `json:"wordIndex,omitempty"`
+	// WordIndex is the fractional reading progress (word index + fraction of
+	// that word's phonemes reached — drives the scrolling reader); omitted
+	// when alignment is unavailable.
+	WordIndex *float64 `json:"wordIndex,omitempty"`
 }
 
 type progressMessage struct {
-	Type      string `json:"type"`
-	WordIndex int    `json:"wordIndex"`
+	Type      string  `json:"type"`
+	WordIndex float64 `json:"wordIndex"`
 }
 
 // job is one unit of scored inference work: a chunk appended to the
@@ -152,8 +154,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cancel: cancel,
 		log:    slog.With("session", id, "remote", r.RemoteAddr),
 	}
-	s.lastIdx.Store(-1)
-	s.chunkIdx.Store(-1)
+	s.lastIdx.Store(math.Float64bits(-1))
+	s.chunkIdx.Store(math.Float64bits(-1))
 	s.run()
 }
 
@@ -166,14 +168,15 @@ type session struct {
 
 	writeMu sync.Mutex
 
-	// lastIdx is the reader position (last matched word), shared by the
-	// chunk and peek workers; only ever advances.
-	lastIdx atomic.Int32
+	// lastIdx is the reader position (fractional progress: word index +
+	// fraction of that word's phonemes reached), shared by the chunk and
+	// peek workers; only ever advances. Stored as math.Float64bits.
+	lastIdx atomic.Uint64
 	// chunkIdx is the chunk-confirmed position (prefix-fitted cumulative
 	// transcript — the ground truth). Chunks reset lastIdx to it, even
 	// backward: that's how a run-ahead reader recalibrates. Peeks may run
-	// at most 12 words ahead of it.
-	chunkIdx atomic.Int32
+	// at most peekLeash words ahead of it. Stored as math.Float64bits.
+	chunkIdx atomic.Uint64
 	// lastAudioAt is the last time an audio frame arrived (unixnano),
 	// read by the idle watcher.
 	lastAudioAt atomic.Int64
@@ -238,7 +241,7 @@ readLoop:
 			if s.autoStop.Load() {
 				// autoFinish tripped the read deadline: finish exactly as if
 				// the client had sent "stop".
-				s.log.Info("auto-finished", "lastIdx", s.lastIdx.Load())
+				s.log.Info("auto-finished", "lastIdx", s.pos())
 				break readLoop
 			}
 			if s.ctx.Err() == nil {
@@ -375,7 +378,7 @@ func (s *session) idleWatcher(done <-chan struct{}, stopped chan<- struct{}, buf
 		if idle < idleTick {
 			continue
 		}
-		if s.lastIdx.Load() < int32(s.wordCount-1) {
+		if s.pos() < float64(s.wordCount-1) {
 			bufMu.Lock()
 			if len(*buf) > 0 {
 				start := len(*buf) - peekWindow
@@ -393,7 +396,7 @@ func (s *session) idleWatcher(done <-chan struct{}, stopped chan<- struct{}, buf
 			bufMu.Unlock()
 		}
 		if idle >= finishSilence &&
-			s.lastIdx.Load() >= int32(s.wordCount-nearEndWords) {
+			s.pos() >= float64(s.wordCount-nearEndWords) {
 			// Near the end and speech stopped: finish even if the last word
 			// was never confidently detected.
 			s.finishOnce.Do(func() { go s.autoFinish(0) })
@@ -430,16 +433,20 @@ func (s *session) awaitStart() (string, bool) {
 	}
 }
 
-// advanceIdx moves the reader position forward (never backward); reports
-// whether it moved. Reaching the last word arms auto-finish.
-func (s *session) advanceIdx(idx int) bool {
+// pos / chunkPos read the fractional reader positions.
+func (s *session) pos() float64      { return math.Float64frombits(s.lastIdx.Load()) }
+func (s *session) chunkPos() float64 { return math.Float64frombits(s.chunkIdx.Load()) }
+
+// advancePos moves the reader position forward (never backward); reports
+// whether it moved. Reaching the last word (half consumed) arms auto-finish.
+func (s *session) advancePos(p float64) bool {
 	for {
 		cur := s.lastIdx.Load()
-		if int32(idx) <= cur {
+		if p <= math.Float64frombits(cur) {
 			return false
 		}
-		if s.lastIdx.CompareAndSwap(cur, int32(idx)) {
-			if idx == s.wordCount-1 {
+		if s.lastIdx.CompareAndSwap(cur, math.Float64bits(p)) {
+			if p >= float64(s.wordCount)-0.5 {
 				s.finishOnce.Do(func() { go s.autoFinish(700 * time.Millisecond) })
 			}
 			return true
@@ -502,14 +509,14 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 			}
 			cumulative.WriteString(ipa)
 			tA := time.Now()
-			if idx, err := s.infer.Align(s.ctx, text, cumulative.String(), int(s.chunkIdx.Load())+chunkStep); err != nil {
+			if idx, err := s.infer.Align(s.ctx, text, cumulative.String(), int(s.chunkPos())+chunkStep); err != nil {
 				s.log.Warn("align failed", "err", err)
 			} else if idx >= 0 {
-				s.log.Info("chunk", "transcribeMs", trMs, "alignMs", time.Since(tA).Milliseconds(), "idx", idx, "prev", s.chunkIdx.Load())
-				s.chunkIdx.Store(int32(idx))
-				s.lastIdx.Store(int32(idx))
+				s.log.Info("chunk", "transcribeMs", trMs, "alignMs", time.Since(tA).Milliseconds(), "idx", idx, "prev", s.chunkPos())
+				s.chunkIdx.Store(math.Float64bits(idx))
+				s.lastIdx.Store(math.Float64bits(idx))
 				msg.WordIndex = &idx
-				if idx == s.wordCount-1 {
+				if idx >= float64(s.wordCount)-0.5 {
 					s.finishOnce.Do(func() { go s.autoFinish(700 * time.Millisecond) })
 				}
 			}
@@ -532,7 +539,7 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 // while a lone flickery match (duplicate word, noise) never gets through.
 func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
-	prevJump := -1 // last peek answer beyond a single step; -1 = none pending
+	prevJump := -1.0 // last peek answer beyond a single step; -1 = none pending
 	for p := range peeks {
 		t0 := time.Now()
 		ipa, err := s.infer.TranscribeFast(s.ctx, p.pcm)
@@ -551,20 +558,20 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		// LOCALLY against a band around the current position — except at the
 		// very start, where the window is the whole recording so far and
 		// prefix fitting is exactly right (and can't float forward).
-		var idx int
+		var idx float64
 		tA := time.Now()
 		if p.whole {
-			idx, err = s.infer.Align(s.ctx, text, ipa, int(s.chunkIdx.Load())+chunkStep)
+			idx, err = s.infer.Align(s.ctx, text, ipa, int(s.chunkPos())+chunkStep)
 		} else {
 			// Caps: at most peekStep past the current position per update
-			// (readers realistically skip <=2 words between 0.33s peeks),
+			// (readers realistically skip <=2 words between 0.25s peeks),
 			// and at most peekLeash ahead of the last chunk-confirmed
 			// position, so peeks can't drift far from ground truth. The
-			// band starts ~6 words back so the whole 2.5 s window stays
+			// band starts ~6 words back so the whole 2 s window stays
 			// alignable even when the strip lags the speech.
-			cur := int(s.lastIdx.Load())
-			maxW := min(cur+peekStep, int(s.chunkIdx.Load())+peekLeash)
-			from := max(0, cur-6)
+			cur := s.pos()
+			maxW := min(int(cur)+peekStep, int(s.chunkPos())+peekLeash)
+			from := max(0, int(cur)-6)
 			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, maxW)
 		}
 		if err != nil {
@@ -573,8 +580,8 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		}
 		s.log.Info("peek", "whole", p.whole, "transcribeMs", trMs,
 			"alignMs", time.Since(tA).Milliseconds(), "ipaLen", len(ipa),
-			"idx", idx, "cur", s.lastIdx.Load(), "chunk", s.chunkIdx.Load())
-		if cur := int(s.lastIdx.Load()); idx > cur+1 {
+			"idx", idx, "cur", s.pos(), "chunk", s.chunkPos())
+		if cur := s.pos(); idx > cur+1 {
 			if prevJump > cur {
 				// Second consecutive jump answer: apply the lower of the
 				// two, then keep tracking the fresh raw answer.
@@ -588,7 +595,7 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		} else {
 			prevJump = -1
 		}
-		if s.advanceIdx(idx) {
+		if s.advancePos(idx) {
 			if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
 				return
 			}

@@ -276,11 +276,27 @@ def _fit_prefix(expected: list[str], actual: list[str], alts: dict[int, list[str
     return best_k
 
 
+def _word_progress(word_tokens: list[list[str]], k: int) -> float:
+    """Fractional reader progress from k consumed expected tokens:
+    word index + fraction of that word's phonemes reached, so the strip can
+    slide continuously instead of stepping whole words. k is 1-based (tokens
+    consumed); word 5 fully consumed -> 6.0 (reading word 6 next).
+    """
+    start = 0
+    for wi, toks in enumerate(word_tokens):
+        end = start + len(toks)
+        if k <= end:
+            return wi + (k - start) / len(toks)
+        start = end
+    return float(len(word_tokens))
+
+
 def align_progress(
     text: str, actual_ipa: str, max_word: int | None = None
-) -> int:
-    """0-based index of the last expected word matched by the speech so far;
-    -1 if nothing has matched yet. Used by the scrolling reader.
+) -> float:
+    """Fractional progress through the passage: word index + fraction of that
+    word's phonemes matched by the speech so far; -1 if nothing has matched
+    yet. Used by the scrolling reader.
 
     max_word hard-caps the answer: expected tokens past that word are removed
     before fitting. Chunks arrive every ~2.5 s, so the position can physically
@@ -302,24 +318,22 @@ def align_progress(
     if k == 0:
         return -1
 
-    owner: list[int] = []
-    for wi, toks in enumerate(word_tokens):
-        owner.extend([wi] * len(toks))
-    return owner[k - 1]
+    return _word_progress(word_tokens, k)
 
 
 def locate_window(
     text: str, actual_ipa: str, from_word: int, span: int = 14,
     max_word: int | None = None,
-) -> int:
+) -> float:
     """Reader position from a short trailing audio window (a "peek").
 
     Unlike align_progress (prefix/fitting, for the cumulative transcript), the
     window contains only the LAST few words spoken, so it is aligned LOCALLY
     against the band of expected words [from_word, from_word + span): the
     matched region may start anywhere in the band, and the answer is the END
-    of the best-matching region. Returns the 0-based word index, or -1 when
-    the match is too poor to trust (silence/noise hallucinations).
+    of the best-matching region as FRACTIONAL progress (word index + fraction
+    of that word's phonemes reached), or -1 when the match is too poor to
+    trust (silence/noise hallucinations).
 
     max_word is a hard cap on the answer. A reader realistically skips at
     most 1-2 words between updates, so a match ending further ahead is always
@@ -397,7 +411,7 @@ def locate_window(
     if best_i <= lo or best_raw > 0.60 * m:
         return -1
 
-    return owner[best_i - 1]
+    return _word_progress(word_tokens, best_i)
 
 
 def score(text: str, actual_ipa: str) -> dict:
