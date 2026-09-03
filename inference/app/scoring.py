@@ -135,6 +135,11 @@ _DP_SUBST_OK = 0.5
 _DP_DEL = 0.25
 _DP_INS = 1.0
 
+# Banded DP width for _fit_prefix: the speech/reference diagonal can drift
+# by at most this many tokens (insertions, stutters) before cells off-band
+# could matter. 64 tokens ≈ 18 words of skew — far beyond real readings.
+_FIT_BAND = 64
+
 
 def _dp_subst(c: float) -> float:
     return c if c <= _DP_SUBST_OK else _DP_DEL + _DP_INS + c
@@ -231,28 +236,40 @@ def _fit_prefix(expected: list[str], actual: list[str], alts: dict[int, list[str
     free. Returns the prefix length k (in tokens). Ties resolve to the
     smallest k — reading starts at the beginning of the passage, unlike
     scoring, where the global alignment may tie-break late.
+
+    The DP is banded (_FIT_BAND tokens around the diagonal): speech tracks
+    the reference roughly token-for-token, so off-band cells can never be on
+    the optimal path, and a full n*m DP on a 200-word passage is ~0.5M cells
+    of pure Python per chunk — seconds of latency the reader feels.
     """
     n, m = len(expected), len(actual)
     if m == 0:
         return 0
+    inf = float("inf")
     prev = [float(j) * _DP_INS for j in range(m + 1)]
     best_k, best_v = 0, prev[m]
     for i in range(1, n + 1):
-        cur = [float(i) * _DP_DEL] + [0.0] * m
+        lo = max(1, i - _FIT_BAND)
+        hi = min(m, i + _FIT_BAND)
+        cur = [inf] * (m + 1)
+        cur[0] = float(i) * _DP_DEL
         ei = expected[i - 1]
         ei_alts = alts.get(i - 1, ())
-        for j in range(1, m + 1):
+        for j in range(lo, hi + 1):
             a = actual[j - 1]
             c = _subst_cost(ei, a)
             for alt in ei_alts:
                 c2 = _subst_cost(alt, a)
                 if c2 < c:
                     c = c2
-            cur[j] = min(
-                prev[j] + _DP_DEL,
-                cur[j - 1] + _DP_INS,
-                prev[j - 1] + _dp_subst(c),
-            )
+            b = prev[j] + _DP_DEL
+            v = cur[j - 1] + _DP_INS
+            if v < b:
+                b = v
+            v = prev[j - 1] + _dp_subst(c)
+            if v < b:
+                b = v
+            cur[j] = b
         if cur[m] < best_v:
             best_v, best_k = cur[m], i
         prev = cur
@@ -292,7 +309,7 @@ def align_progress(
 
 
 def locate_window(
-    text: str, actual_ipa: str, from_word: int, span: int = 8,
+    text: str, actual_ipa: str, from_word: int, span: int = 14,
     max_word: int | None = None,
 ) -> int:
     """Reader position from a short trailing audio window (a "peek").
@@ -331,12 +348,16 @@ def locate_window(
 
     # Local alignment over expected[lo:hi]: dp rows = expected tokens, cols =
     # actual tokens; cur[0] = 0 lets the matched region start anywhere in the
-    # band; the answer is the best final column over band rows, ties toward
-    # the earlier end. A short window's few phonemes can cheaply match MANY
-    # places in the band, so region selection adds a drift penalty per token
-    # of distance from the band start (0.05/token ≈ one phoneme mismatch per
-    # 2 words) — the reader is almost always at the NEAR end of the band, and
-    # only genuinely unambiguous speech should pull it further out.
+    # band; the answer is the END of the best-matching region, ties toward
+    # the earlier end. Leading actual tokens cost full insertions, so the
+    # band must be wide enough to contain the whole window — the backend
+    # starts the band ~6 words behind the strip (a 2.5 s window covers at
+    # most ~12 words even at 290 wpm). A short window's few phonemes can
+    # cheaply match MANY places in the band, so region selection adds a
+    # drift penalty per token of distance from the band start (0.05/token ≈
+    # one phoneme mismatch per 2 words); the dominant force is tail
+    # consumption (1.0/inserted token), which anchors the answer at the true
+    # end of the speech.
     owner: list[int] = []
     for wi, toks in enumerate(word_tokens):
         owner.extend([wi] * len(toks))
@@ -368,12 +389,12 @@ def locate_window(
             best_sel, best_i, best_raw = sel, i, cur[m]
         prev = cur
 
-    # Reject noise: genuine speech windows align at ~0.02-0.19 cost/token and
-    # stay under the bar; anything needing garbage substitutions now costs
-    # >2.0/token (see _dp_subst) and is rejected outright. Real (denoised)
-    # white noise transcribes to empty and never reaches here; hums/breaths
-    # are caught by the vowel-soup guard above.
-    if best_i <= lo or best_raw > 0.30 * m:
+    # Reject noise: genuine speech windows align at ~0.15-0.45 cost/token
+    # (clean slow speech ~0.15; fast, garbled TTS ~0.45), while true noise
+    # must insert (~1.0) or garbage-substitute (>1.25) every token — a wide
+    # margin either way. Real (denoised) white noise transcribes to empty and
+    # never reaches here; hums/breaths are caught by the vowel-soup guard.
+    if best_i <= lo or best_raw > 0.60 * m:
         return -1
 
     return owner[best_i - 1]

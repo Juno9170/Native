@@ -6,6 +6,7 @@ space-separated phonemes with space-separated words.
 """
 
 import os
+import threading
 
 import numpy as np
 import torch
@@ -32,6 +33,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor: Wav2Vec2Processor | None = None
 model: Wav2Vec2ForCTC | None = None
 
+# /transcribe now runs in a threadpool (chunks and reader peeks in parallel);
+# serialize the actual GPU inference — denoise etc. stays concurrent.
+_model_lock = threading.Lock()
+
 
 def load_model() -> None:
     """Load processor + model once at startup and move to the device."""
@@ -44,10 +49,11 @@ def load_model() -> None:
 
 @torch.no_grad()
 def _decode_chunk(audio: np.ndarray) -> str:
-    inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-    logits = model(inputs.input_values.to(device)).logits
-    pred_ids = logits.argmax(dim=-1)
-    text = processor.batch_decode(pred_ids)[0]
+    with _model_lock:
+        inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+        logits = model(inputs.input_values.to(device)).logits
+        pred_ids = logits.argmax(dim=-1)
+        text = processor.batch_decode(pred_ids)[0]
     return text.replace("|", " ").strip()
 
 

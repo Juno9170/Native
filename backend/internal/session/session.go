@@ -60,12 +60,13 @@ const (
 	// position is a duplicate-word coincidence, never intent:
 	//   peekStep: a peek may advance at most this many words per update.
 	//   peekLeash: peeks may run at most this far ahead of the
-	//     chunk-confirmed ground truth.
+	//     chunk-confirmed ground truth (chunkStep + slack, so peeks can keep
+	//     up with fast reading between chunk landings).
 	//   chunkStep: the chunk-confirmed position may advance at most this
-	//     many words per ~2.5 s chunk (~190 wpm — faster than real reading).
+	//     many words per ~2.5 s chunk (~290 wpm — faster than real reading).
 	peekStep  = 2
-	peekLeash = 5
-	chunkStep = 8
+	peekLeash = 12
+	chunkStep = 12
 )
 
 var nextID atomic.Uint64
@@ -520,13 +521,14 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 // and emits progress frames when the reader position advances. Peek failures
 // are non-fatal — the reader just updates on the next one.
 //
-// Advances are deliberately sticky: the next word over applies instantly,
-// but a JUMP (more than one word) only applies after two consecutive peeks
-// agree on the same target. Peeks overlap ~87%, so a genuine skip confirms
-// within ~0.3 s, while flickery duplicate-word matches never get through.
+// Advances are deliberately smoothed: a single step (next word) applies
+// instantly, but a JUMP (more than one word) applies only as the LOWER of
+// two consecutive jump answers. Peeks overlap ~87%, so during fast reading
+// the answers climb every peek and the strip still advances every peek,
+// while a lone flickery match (duplicate word, noise) never gets through.
 func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
-	pending, pendingN := -1, 0
+	prevJump := -1 // last peek answer beyond a single step; -1 = none pending
 	for p := range peeks {
 		ipa, err := s.infer.TranscribeFast(s.ctx, p.pcm)
 		if err != nil {
@@ -550,10 +552,12 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 			// Caps: at most peekStep past the current position per update
 			// (readers realistically skip <=2 words between 0.33s peeks),
 			// and at most peekLeash ahead of the last chunk-confirmed
-			// position, so peeks can't drift far from ground truth.
+			// position, so peeks can't drift far from ground truth. The
+			// band starts ~6 words back so the whole 2.5 s window stays
+			// alignable even when the strip lags the speech.
 			cur := int(s.lastIdx.Load())
 			maxW := min(cur+peekStep, int(s.chunkIdx.Load())+peekLeash)
-			from := max(0, cur-1)
+			from := max(0, cur-6)
 			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, maxW)
 		}
 		if err != nil {
@@ -561,17 +565,19 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 			continue
 		}
 		if cur := int(s.lastIdx.Load()); idx > cur+1 {
-			// Jump: needs the same target twice in a row before applying.
-			if idx == pending {
-				pendingN++
+			if prevJump > cur {
+				// Second consecutive jump answer: apply the lower of the
+				// two, then keep tracking the fresh raw answer.
+				idx, prevJump = min(idx, prevJump), idx
 			} else {
-				pending, pendingN = idx, 1
-			}
-			if pendingN < 2 {
+				// First jump sighting (or the strip already passed it):
+				// hold it, wait for the next peek to confirm.
+				prevJump = idx
 				continue
 			}
+		} else {
+			prevJump = -1
 		}
-		pending, pendingN = -1, 0
 		if s.advanceIdx(idx) {
 			if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
 				return

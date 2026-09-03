@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from . import scoring, transcribe
@@ -33,7 +34,10 @@ async def transcribe_ep(request: Request, denoise: bool | None = None) -> dict:
         raise HTTPException(
             status_code=400, detail="pcm16 payload must have an even byte count"
         )
-    return {"ipa": transcribe.transcribe_pcm16(body, denoise=denoise)}
+    # Off the event loop: denoise + transcription are blocking CPU/GPU work,
+    # and a scored chunk must never starve the reader's peek requests.
+    ipa = await run_in_threadpool(transcribe.transcribe_pcm16, body, denoise)
+    return {"ipa": ipa}
 
 
 class ScoreRequest(BaseModel):
