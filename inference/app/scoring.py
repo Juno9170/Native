@@ -13,15 +13,20 @@ we strip from one side must be stripped from the other.
 
 Distance: panphon FeatureEditDistance at the phoneme-token level. Whole
 utterances are compared via a DP alignment whose substitution cost is the
-panphon feature edit distance between the two aligned tokens (indel cost 1).
-Scores are normalized to 0..1: score = 1 - dist / region, clamped at 0, where
-1 means identical.
+panphon feature edit distance between the two aligned tokens (indel cost 1),
+thresholded at 0.5 — a worse substitution costs more than a gap, so the DP
+never smears speech thinly across unread words (see _dp_subst). Scores are
+normalized to 0..1: score = 1 - dist / region, clamped at 0, where 1 means
+identical.
 
-Partial runs: a word counts as said only if enough of its phonemes matched
-well (>= min(tokens, 2) matches at cost <= 0.5). Reading ends at the first
-run of >=3 consecutive unsaid words — expected tokens past that cutoff are
-free (stopped early), while skipped words inside the reached region still
-cost. If nothing was reached at all, the overall score is 0.
+Partial runs: scoring is two-pass. First a fitting alignment locates the
+frontier (how far the reader got); the full alignment then runs ONLY within
+that reached region — a global alignment over the whole passage would smear
+the speech thinly across unread words. A word counts as said only if enough
+of its phonemes matched well (>= min(tokens, 2) matches at cost <= 0.5), and
+a frontier walk (skip tolerance <=2 words) trims pass-1 overshoot. Expected
+tokens past the frontier are free (stopped early); skipped words inside the
+reached region still cost. If nothing was reached at all, the score is 0.
 """
 
 import re
@@ -108,6 +113,33 @@ def _subst_cost_cached(a: str, b: str) -> float:
     return float(_dist.feature_edit_distance(a, b))
 
 
+# The alignment DPs use ASYMMETRIC, THRESHOLDED costs — not raw Levenshtein:
+#
+#   substitution  raw panphon cost when <= 0.5, else 2.0 + cost
+#   deletion      0.25 per expected token (skipped reference phoneme)
+#   insertion     1.00 per actual token (extra spoken phoneme)
+#
+# Why: raw costs make two failure modes cheaper than the truth.
+#   1. Unrelated phonemes are often only ~0.2-0.5 apart in panphon space
+#      (voiced plosives d~b ≈ 0.1!), always cheaper than a 2.0 delete+insert
+#      pair — so the DP substitutes garbage rather than gapping, smearing the
+#      transcript thinly across words nobody read (a real "dog" aligning onto
+#      "above" three words later). Deleting an expected token must be cheaper
+#      than a lucky-but-wrong substitution, hence 0.25.
+#   2. Any substitution beyond the "good match" bar (0.5, the same threshold
+#      the scoring side uses) is not a pronunciation variant, it's a gap —
+#      priced above delete+insert (1.25) so the DP never takes it.
+# Good matches (0.0-0.25) still always win, so read regions align densely.
+# Word scores still use the raw graded cost; only the DP search sees this.
+_DP_SUBST_OK = 0.5
+_DP_DEL = 0.25
+_DP_INS = 1.0
+
+
+def _dp_subst(c: float) -> float:
+    return c if c <= _DP_SUBST_OK else _DP_DEL + _DP_INS + c
+
+
 def _positional_cost(
     i: int, expected: list[str], alts: dict[int, list[str]], actual_tok: str
 ) -> float:
@@ -133,17 +165,17 @@ def _align(
     """
     alts = alts or {}
     n, m = len(expected), len(actual)
-    cost = [[_positional_cost(i, expected, alts, actual[j]) for j in range(m)] for i in range(n)]
+    cost = [[_dp_subst(_positional_cost(i, expected, alts, actual[j])) for j in range(m)] for i in range(n)]
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
-        dp[i][0] = i
+        dp[i][0] = i * _DP_DEL
     for j in range(1, m + 1):
-        dp[0][j] = j
+        dp[0][j] = j * _DP_INS
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             dp[i][j] = min(
-                dp[i - 1][j] + 1.0,
-                dp[i][j - 1] + 1.0,
+                dp[i - 1][j] + _DP_DEL,
+                dp[i][j - 1] + _DP_INS,
                 dp[i - 1][j - 1] + cost[i - 1][j - 1],
             )
     pairs: list[tuple[int | None, int | None]] = []
@@ -153,7 +185,7 @@ def _align(
         # deleting expected tokens (moving up without consuming actual), so
         # with repeated content the actual speech anchors to the first
         # occurrence, not the last.
-        if i > 0 and dp[i][j] == dp[i - 1][j] + 1.0:
+        if i > 0 and dp[i][j] == dp[i - 1][j] + _DP_DEL:
             pairs.append((i - 1, None))
             i -= 1
         elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + cost[i - 1][j - 1]:
@@ -203,10 +235,10 @@ def _fit_prefix(expected: list[str], actual: list[str], alts: dict[int, list[str
     n, m = len(expected), len(actual)
     if m == 0:
         return 0
-    prev = [float(j) for j in range(m + 1)]
+    prev = [float(j) * _DP_INS for j in range(m + 1)]
     best_k, best_v = 0, prev[m]
     for i in range(1, n + 1):
-        cur = [float(i)] + [0.0] * m
+        cur = [float(i) * _DP_DEL] + [0.0] * m
         ei = expected[i - 1]
         ei_alts = alts.get(i - 1, ())
         for j in range(1, m + 1):
@@ -216,16 +248,27 @@ def _fit_prefix(expected: list[str], actual: list[str], alts: dict[int, list[str
                 c2 = _subst_cost(alt, a)
                 if c2 < c:
                     c = c2
-            cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
+            cur[j] = min(
+                prev[j] + _DP_DEL,
+                cur[j - 1] + _DP_INS,
+                prev[j - 1] + _dp_subst(c),
+            )
         if cur[m] < best_v:
             best_v, best_k = cur[m], i
         prev = cur
     return best_k
 
 
-def align_progress(text: str, actual_ipa: str) -> int:
+def align_progress(
+    text: str, actual_ipa: str, max_word: int | None = None
+) -> int:
     """0-based index of the last expected word matched by the speech so far;
     -1 if nothing has matched yet. Used by the scrolling reader.
+
+    max_word hard-caps the answer: expected tokens past that word are removed
+    before fitting. Chunks arrive every ~2.5 s, so the position can physically
+    advance only so far between them — uncapped prefix fitting lets transcript
+    noise cheap-match its way into words nobody has read yet.
 
     Raises ValueError if the text contains no scoreable words.
     """
@@ -233,6 +276,10 @@ def align_progress(text: str, actual_ipa: str) -> int:
     if not words:
         raise ValueError("text contains no scoreable words")
     actual_tokens = normalize_ipa(actual_ipa).split()
+
+    if max_word is not None and 0 <= max_word < len(words) - 1:
+        end = sum(len(t) for t in word_tokens[: max_word + 1])
+        expected_tokens = expected_tokens[:end]
 
     k = _fit_prefix(expected_tokens, actual_tokens, alts)
     if k == 0:
@@ -245,7 +292,7 @@ def align_progress(text: str, actual_ipa: str) -> int:
 
 
 def locate_window(
-    text: str, actual_ipa: str, from_word: int, span: int = 25,
+    text: str, actual_ipa: str, from_word: int, span: int = 8,
     max_word: int | None = None,
 ) -> int:
     """Reader position from a short trailing audio window (a "peek").
@@ -286,19 +333,16 @@ def locate_window(
     # actual tokens; cur[0] = 0 lets the matched region start anywhere in the
     # band; the answer is the best final column over band rows, ties toward
     # the earlier end. A short window's few phonemes can cheaply match MANY
-    # places in the band, so region selection adds a small drift penalty per
-    # token of distance from the band start (0.02/token ≈ one phoneme
-    # mismatch per 5 words) — enough to anchor the reader near the current
-    # position, far too small to override a genuine match. Rows past max_word
-    # are still computed (the match may legitimately START there... no — the
-    # region END is the answer, so rows past the cap are simply never
-    # candidates).
+    # places in the band, so region selection adds a drift penalty per token
+    # of distance from the band start (0.05/token ≈ one phoneme mismatch per
+    # 2 words) — the reader is almost always at the NEAR end of the band, and
+    # only genuinely unambiguous speech should pull it further out.
     owner: list[int] = []
     for wi, toks in enumerate(word_tokens):
         owner.extend([wi] * len(toks))
 
     m = len(actual_tokens)
-    prev = [float(j) for j in range(m + 1)]  # virtual row before the band
+    prev = [float(j) * _DP_INS for j in range(m + 1)]  # virtual row before the band
     best_i, best_sel, best_raw = lo, float("inf"), float("inf")
     for i in range(lo + 1, hi + 1):
         cur = [0.0] + [0.0] * m
@@ -311,20 +355,24 @@ def locate_window(
                 c2 = _subst_cost(alt, a)
                 if c2 < c:
                     c = c2
-            cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
+            cur[j] = min(
+                prev[j] + _DP_DEL,
+                cur[j - 1] + _DP_INS,
+                prev[j - 1] + _dp_subst(c),
+            )
         if max_word is not None and owner[i - 1] > max_word:
             prev = cur
             continue  # region ends past the skip cap: not a candidate
-        sel = cur[m] + 0.02 * (i - lo)
+        sel = cur[m] + 0.05 * (i - lo)
         if sel < best_sel:
             best_sel, best_i, best_raw = sel, i, cur[m]
         prev = cur
 
-    # Reject noise: measured on this pipeline — TTS speech windows align at
-    # ~0.15-0.19 cost/token, clean synthetic speech ~0.02-0.12, random-phoneme
-    # noise ~0.26. Real (denoised) white noise transcribes to empty and never
-    # reaches here; hums/breaths are caught by the vowel-soup guard above.
-    # Threshold errs toward accepting accented speech over rejecting noise.
+    # Reject noise: genuine speech windows align at ~0.02-0.19 cost/token and
+    # stay under the bar; anything needing garbage substitutions now costs
+    # >2.0/token (see _dp_subst) and is rejected outright. Real (denoised)
+    # white noise transcribes to empty and never reaches here; hums/breaths
+    # are caught by the vowel-soup guard above.
     if best_i <= lo or best_raw > 0.30 * m:
         return -1
 
@@ -341,22 +389,31 @@ def score(text: str, actual_ipa: str) -> dict:
         raise ValueError("text contains no scoreable words")
     actual_tokens = normalize_ipa(actual_ipa).split()
 
-    pairs = _align(expected_tokens, actual_tokens, alts)
-
     # Expected-token index -> owning word index.
     owner: list[int] = []
     for wi, toks in enumerate(word_tokens):
         owner.extend([wi] * len(toks))
 
-    # Run-end detection. "last matched token" alone is unreliable on long
-    # passages: lenient substitution costs spuriously match a few tokens near
-    # the end, marking unread words as reached. Instead, a word is UNSAID
-    # when almost none of its expected phonemes matched well, and reading is
-    # over at the first unsaid word followed by a (>=3-word) suffix with at
-    # most one said word in it — a reader realistically skips 1-2 words, so
-    # a long quiet tail means "stopped here". Expected tokens past the cutoff
-    # are free (stopped early); unsaid words within the reached region still
-    # cost (skipped mid-run).
+    # Pass 1 — find the frontier: fit the transcript against a PREFIX of the
+    # passage. A global alignment over the whole passage smears the speech
+    # thinly across unread words (every actual phoneme must be consumed, and
+    # a lucky ~0.3 substitution always beats inserting it), which both marks
+    # unread words as read and strips attribution from words that WERE read.
+    # Restricting the alignment to the reached region keeps it dense.
+    k = _fit_prefix(expected_tokens, actual_tokens, alts)
+    fit_cutoff = 0 if k == 0 else owner[k - 1] + 1
+    end_tok = sum(len(t) for t in word_tokens[:fit_cutoff])
+
+    # Pass 2 — global alignment within the reached region only.
+    pairs = _align(expected_tokens[:end_tok], actual_tokens, alts) if end_tok else []
+
+    # Frontier walk: a word is SAID when enough of its phonemes matched well,
+    # and reading is sequential — a said word extends the reached region only
+    # within skipping distance (<=2 words) of the frontier. This trims any
+    # overshoot from pass 1 (e.g. trailing noise lucky-matching a word or two
+    # past where the reader actually stopped). Expected tokens past the
+    # frontier are free (stopped early); unsaid words within the reached
+    # region still cost (skipped mid-run).
     good = [0] * len(words)  # good (low-cost) matches per word
     for e, a in pairs:
         if e is not None and a is not None and _positional_cost(
@@ -367,20 +424,11 @@ def score(text: str, actual_ipa: str) -> dict:
     def said(wi: int) -> bool:
         return good[wi] >= min(len(word_tokens[wi]), 2)
 
-    said_mask = [said(wi) for wi in range(len(words))]
-    # Reading is over at the first unsaid word whose suffix (>=3 words long)
-    # contains at most one said word — a reader realistically skips 1-2 words,
-    # so a long unsaid tail means "stopped here", and one said word in it is
-    # tolerated as a spurious late match. Fallback for short tails: cutoff
-    # right after the last said word.
-    cutoff = len(words)
-    for c in range(len(words) - 2):
-        if not said_mask[c] and sum(said_mask[c:]) <= 1:
-            cutoff = c
-            break
-    if cutoff == len(words) and not all(said_mask):
-        last_said = max((wi for wi, s in enumerate(said_mask) if s), default=-1)
-        cutoff = last_said + 1
+    frontier = -1
+    for wi in range(fit_cutoff):
+        if said(wi) and wi <= frontier + 3:
+            frontier = wi
+    cutoff = frontier + 1
     # Token index of the end of the last reached word (-1 if none reached).
     last_tok = sum(len(t) for t in word_tokens[:cutoff]) - 1
 
@@ -393,7 +441,7 @@ def score(text: str, actual_ipa: str) -> dict:
             # attributed to any word (word boundaries are ambiguous there).
             total_dist += 1.0
             continue
-        if a is None and e > last_tok:
+        if e > last_tok:
             continue  # past the cutoff: unreached word, free
         wi = owner[e]
         if a is None:

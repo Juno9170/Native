@@ -139,13 +139,19 @@ func (c *Client) Score(ctx context.Context, text, actualIPA string) (*ScoreRespo
 
 // Align posts the reference text and IPA to /align (mode "prefix": actualIPA
 // is the cumulative transcript) and returns the last matched word index
-// (-1 = nothing matched yet).
-func (c *Client) Align(ctx context.Context, text, actualIPA string) (int, error) {
-	return c.align(ctx, map[string]any{
+// (-1 = nothing matched yet). maxWord >= 0 hard-caps the answer — chunks
+// arrive every ~2.5 s, so the position can physically advance only so far
+// between them. Pass a negative maxWord for no cap.
+func (c *Client) Align(ctx context.Context, text, actualIPA string, maxWord int) (int, error) {
+	payload := map[string]any{
 		"text":      text,
 		"actualIpa": actualIPA,
 		"mode":      "prefix",
-	})
+	}
+	if maxWord >= 0 {
+		payload["maxWord"] = maxWord
+	}
+	return c.align(ctx, payload)
 }
 
 // AlignWindow is mode "window": actualIPA is a short trailing window, aligned

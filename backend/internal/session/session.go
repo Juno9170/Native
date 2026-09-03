@@ -55,6 +55,17 @@ const (
 	idleTick      = time.Second
 	finishSilence = 2500 * time.Millisecond
 	nearEndWords  = 3
+
+	// Locality caps — speech is sequential, so a match far from the current
+	// position is a duplicate-word coincidence, never intent:
+	//   peekStep: a peek may advance at most this many words per update.
+	//   peekLeash: peeks may run at most this far ahead of the
+	//     chunk-confirmed ground truth.
+	//   chunkStep: the chunk-confirmed position may advance at most this
+	//     many words per ~2.5 s chunk (~190 wpm — faster than real reading).
+	peekStep  = 2
+	peekLeash = 5
+	chunkStep = 8
 )
 
 var nextID atomic.Uint64
@@ -191,7 +202,7 @@ func (s *session) run() {
 	// the first /align during recording doesn't stall for seconds on long
 	// passages. An empty IPA populates the cache and returns immediately.
 	go func() {
-		if _, err := s.infer.Align(s.ctx, text, ""); err != nil {
+		if _, err := s.infer.Align(s.ctx, text, "", -1); err != nil {
 			s.log.Warn("cache warm-up failed", "err", err)
 		}
 	}()
@@ -487,7 +498,7 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 				cumulative.WriteString(" ")
 			}
 			cumulative.WriteString(ipa)
-			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
+			if idx, err := s.infer.Align(s.ctx, text, cumulative.String(), int(s.chunkIdx.Load())+chunkStep); err != nil {
 				s.log.Warn("align failed", "err", err)
 			} else if idx >= 0 {
 				s.chunkIdx.Store(int32(idx))
@@ -508,8 +519,14 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 // peekWorker transcribes trailing-window peeks (denoise off, low latency)
 // and emits progress frames when the reader position advances. Peek failures
 // are non-fatal — the reader just updates on the next one.
+//
+// Advances are deliberately sticky: the next word over applies instantly,
+// but a JUMP (more than one word) only applies after two consecutive peeks
+// agree on the same target. Peeks overlap ~87%, so a genuine skip confirms
+// within ~0.3 s, while flickery duplicate-word matches never get through.
 func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text string) {
 	defer wg.Done()
+	pending, pendingN := -1, 0
 	for p := range peeks {
 		ipa, err := s.infer.TranscribeFast(s.ctx, p.pcm)
 		if err != nil {
@@ -528,21 +545,33 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		// prefix fitting is exactly right (and can't float forward).
 		var idx int
 		if p.whole {
-			idx, err = s.infer.Align(s.ctx, text, ipa)
+			idx, err = s.infer.Align(s.ctx, text, ipa, int(s.chunkIdx.Load())+chunkStep)
 		} else {
-			// Caps: at most +3 past the current position per update (readers
-			// realistically skip <=2 words between 0.33s peeks), and at most
-			// 12 words ahead of the last chunk-confirmed position, so peeks
-			// can't drift arbitrarily far from ground truth.
+			// Caps: at most peekStep past the current position per update
+			// (readers realistically skip <=2 words between 0.33s peeks),
+			// and at most peekLeash ahead of the last chunk-confirmed
+			// position, so peeks can't drift far from ground truth.
 			cur := int(s.lastIdx.Load())
-			maxW := min(cur+3, int(s.chunkIdx.Load())+12)
-			from := max(0, cur-3)
+			maxW := min(cur+peekStep, int(s.chunkIdx.Load())+peekLeash)
+			from := max(0, cur-1)
 			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, maxW)
 		}
 		if err != nil {
 			s.log.Warn("peek align failed", "err", err)
 			continue
 		}
+		if cur := int(s.lastIdx.Load()); idx > cur+1 {
+			// Jump: needs the same target twice in a row before applying.
+			if idx == pending {
+				pendingN++
+			} else {
+				pending, pendingN = idx, 1
+			}
+			if pendingN < 2 {
+				continue
+			}
+		}
+		pending, pendingN = -1, 0
 		if s.advanceIdx(idx) {
 			if err := s.writeJSON(progressMessage{Type: "progress", WordIndex: idx}); err != nil {
 				return

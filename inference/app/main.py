@@ -66,10 +66,12 @@ class AlignRequest(BaseModel):
     text: str
     actualIpa: str
     # "prefix" (default): actual is the cumulative transcript; fitting
-    # alignment. "window": actual is a short trailing window; local alignment
-    # against the band of words starting at fromWord, never answering beyond
-    # maxWord (readers realistically skip ≤2 words between updates; a further
-    # match is a duplicate-word coincidence).
+    # alignment, hard-capped at maxWord (chunks arrive every ~2.5 s, so the
+    # position can physically advance only so far between them).
+    # "window": actual is a short trailing window; local alignment against
+    # the band of words starting at fromWord, never answering beyond maxWord
+    # (readers realistically skip ≤2 words between updates; a further match
+    # is a duplicate-word coincidence).
     mode: str = "prefix"
     fromWord: int = 0
     maxWord: int | None = None
@@ -84,6 +86,10 @@ def align_ep(req: AlignRequest) -> dict:
                     req.text, req.actualIpa, req.fromWord, max_word=req.maxWord
                 )
             }
-        return {"wordIndex": scoring.align_progress(req.text, req.actualIpa)}
+        return {
+            "wordIndex": scoring.align_progress(
+                req.text, req.actualIpa, max_word=req.maxWord
+            )
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
