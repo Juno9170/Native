@@ -603,7 +603,8 @@ h3 {
   -webkit-mask-image: linear-gradient(90deg, transparent, black 6%, black 94%, transparent);
 }
 
-/* Warm-up state: shown until the reader is live (first word underlined). */
+/* Warm-up state: shown until the reader is live (first word underlined).
+   Standalone — the runway strip itself only appears once it's tracking. */
 .strip-loading {
   display: flex;
   align-items: center;
@@ -613,6 +614,11 @@ h3 {
   font-family: var(--font-display);
   font-style: italic;
   font-size: 1.1rem;
+}
+
+.strip-loading-standalone {
+  margin: 0.4rem 0 0.8rem;
+  padding: 1.6rem 0;
 }
 
 .strip-loading .loading-dot {

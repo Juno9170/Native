@@ -62,6 +62,16 @@ export function usePronunciationSession() {
     }
   }, []);
 
+  // The clock starts when the reader goes live (first word tracked), not on
+  // "ready" — warm-up time isn't the user's reading time.
+  const startTimer = useCallback(() => {
+    if (timerRef.current) return;
+    startTimeRef.current = Date.now();
+    timerRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000));
+    }, 250);
+  }, []);
+
   const closeAudio = useCallback(() => {
     if (nodeRef.current) {
       nodeRef.current.port.onmessage = null;
@@ -128,10 +138,6 @@ export function usePronunciationSession() {
             for (const chunk of pendingRef.current) ws.send(chunk);
           }
           pendingRef.current = [];
-          startTimeRef.current = Date.now();
-          timerRef.current = setInterval(() => {
-            setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000));
-          }, 250);
           setStatus('recording');
           break;
         }
@@ -140,12 +146,14 @@ export function usePronunciationSession() {
           if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
             // Chunk alignments are ground truth and may recalibrate BACKWARD
             // to fix a run-ahead reader.
+            startTimer();
             setWordIndex(msg.wordIndex);
           }
           break;
         case 'progress':
           // Peek alignments are hints: never move the strip backward.
           if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
+            startTimer();
             setWordIndex((cur) => Math.max(cur, msg.wordIndex));
           }
           break;
@@ -171,7 +179,7 @@ export function usePronunciationSession() {
           break;
       }
     },
-    [stopTimer, closeAudio, closeWs, fail],
+    [stopTimer, startTimer, closeAudio, closeWs, fail],
   );
 
   const start = useCallback(

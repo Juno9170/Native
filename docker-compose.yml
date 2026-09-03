@@ -14,7 +14,8 @@ services:
     ports:
       - "8080:8080" # host access for the Vite dev server's /ws proxy
     depends_on:
-      - inference
+      inference:
+        condition: service_healthy # model loaded; sessions die without it
 
   inference:
     build: ./inference
@@ -24,6 +25,11 @@ services:
       - "9000"
     volumes:
       - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 60 # model load takes ~1 min; keep checking for 5
     deploy:
       resources:
         reservations:

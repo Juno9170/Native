@@ -32,27 +32,30 @@ export default function WordStrip({ words, currentIndex, loading }) {
   }, [currentIndex, words.length, loading]);
 
   const current = Math.floor(currentIndex);
+  if (loading) {
+    // Warm-up: no runway yet — just the loader, so "not ready" is obvious
+    // and the strip appears only once it's actually tracking.
+    return (
+      <p className="strip-loading strip-loading-standalone" aria-live="polite">
+        <span className="loading-dot" aria-hidden="true" />
+        <span className="loading-dot" aria-hidden="true" />
+        <span className="loading-dot" aria-hidden="true" />
+        <span>warming up your words…</span>
+      </p>
+    );
+  }
   return (
     <div className="word-strip" ref={stripRef} aria-label="Reading progress">
-      {loading ? (
-        <p className="strip-loading" aria-live="polite">
-          <span className="loading-dot" aria-hidden="true" />
-          <span className="loading-dot" aria-hidden="true" />
-          <span className="loading-dot" aria-hidden="true" />
-          <span>warming up your words…</span>
-        </p>
-      ) : (
-        <div className="word-strip-track" ref={trackRef}>
-          {words.map((w, i) => (
-            <span
-              key={i}
-              className={`strip-word ${i < current ? 'spoken' : ''} ${i === current ? 'current' : ''}`}
-            >
-              {w}
-            </span>
-          ))}
-        </div>
-      )}
+      <div className="word-strip-track" ref={trackRef}>
+        {words.map((w, i) => (
+          <span
+            key={i}
+            className={`strip-word ${i < current ? 'spoken' : ''} ${i === current ? 'current' : ''}`}
+          >
+            {w}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
