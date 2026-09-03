@@ -34,6 +34,7 @@ body {
   color: var(--ink);
   font-family: var(--font-body);
   line-height: 1.6;
+  overflow-x: clip; /* the reader strip intentionally bleeds wider than the card */
 }
 
 /* Subtle grain over everything */
@@ -592,8 +593,56 @@ h3 {
   margin: 0.4rem 0 0.8rem;
   border-top: 2px dashed var(--sand);
   border-bottom: 2px dashed var(--sand);
-  mask-image: linear-gradient(90deg, transparent, black 15%, black 85%, transparent);
-  -webkit-mask-image: linear-gradient(90deg, transparent, black 15%, black 85%, transparent);
+  /* Full-bleed runway: wider than the card so the reader can see further
+     ahead. Centered on the card; body clips the overflow. */
+  width: min(1200px, 94vw);
+  position: relative;
+  left: 50%;
+  transform: translateX(-50%);
+  mask-image: linear-gradient(90deg, transparent, black 6%, black 94%, transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, black 6%, black 94%, transparent);
+}
+
+/* Warm-up state: shown until the reader is live (first word underlined). */
+.strip-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  color: var(--stone);
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 1.1rem;
+}
+
+.strip-loading .loading-dot {
+  width: 9px;
+  height: 9px;
+  background: var(--terracotta);
+  border-radius: 55% 45% 50% 60% / 45% 55% 45% 60%; /* organic, handmade */
+  animation: loading-bounce 1.1s var(--ease-natural) infinite;
+}
+
+.strip-loading .loading-dot:nth-child(2) {
+  animation-delay: 0.15s;
+  background: var(--rust);
+}
+
+.strip-loading .loading-dot:nth-child(3) {
+  animation-delay: 0.3s;
+  background: var(--olive);
+}
+
+@keyframes loading-bounce {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-2deg);
+    opacity: 0.55;
+  }
+  45% {
+    transform: translateY(-7px) rotate(3deg);
+    opacity: 1;
+  }
 }
 
 .word-strip-track {

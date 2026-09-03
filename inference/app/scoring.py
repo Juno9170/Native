@@ -6,6 +6,8 @@ any comparison (see normalize_ipa):
   - Unicode NFC
   - strip primary/secondary stress marks (U+02C8, U+02CC)
   - strip tie bars (U+0361, U+035C) and syllable breaks (.)
+  - split r-colored vowels ("ɔːɹ" -> "ɔː ɹ") — espeak emits them as one
+    phone token, the wav2vec2 model usually as two
   - collapse whitespace
 Rationale: the wav2vec2 espeak model omits some diacritics (notably stress),
 so both sides are reduced to the same unstressed segment inventory. Anything
@@ -62,6 +64,22 @@ _phone_sep = Separator(word=" ", syllable="", phone="|")
 _STRIP_RE = re.compile(r"[ˈˌ͜͡.]")
 _WORD_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")
 
+# R-colored vowels: espeak emits "ɔːɹ" as ONE phone token, while the
+# wav2vec2 model usually splits it ("ɔː" "ɹ") — and occasionally doesn't.
+# The distance between the merged and split forms is large enough that the
+# DP prefers gapping entirely, which is how genuinely-read words like "or"
+# ended up with zero attributed phonemes. Split the digraph on BOTH sides.
+_R_COLORED_RE = re.compile(r"([aeiouɑæɜəʌɔɪʊɛːˑ]+)ɹ")
+
+
+def normalize_ipa(s: str) -> str:
+    """Strip stress marks / tie bars / syllable breaks; split r-colored
+    vowels; collapse whitespace."""
+    s = unicodedata.normalize("NFC", s)
+    s = _STRIP_RE.sub("", s)
+    s = _R_COLORED_RE.sub(r"\1 ɹ", s)
+    return " ".join(s.split())
+
 # Common English function words: espeak word-alone phonemization returns the
 # CITATION form ("a" -> eɪ, "to" -> tuː), but connected speech almost always
 # uses the REDUCED form (ə, tə). Both are correct; accept either at equal
@@ -84,13 +102,6 @@ _FUNCTION_WORD_ALTS: dict[str, list[list[str]]] = {
 }
 
 
-def normalize_ipa(s: str) -> str:
-    """Strip stress marks / tie bars / syllable breaks; collapse whitespace."""
-    s = unicodedata.normalize("NFC", s)
-    s = _STRIP_RE.sub("", s)
-    return " ".join(s.split())
-
-
 def _phonemize_word(word: str) -> list[str]:
     """Expected phoneme tokens for a single word, normalized."""
     out = phonemize(
@@ -98,6 +109,26 @@ def _phonemize_word(word: str) -> list[str]:
     )
     out = normalize_ipa(out)
     return [tok for chunk in out.split() for tok in chunk.split("|") if tok]
+
+
+def _phonemize_words(words: list[str]) -> list[list[str]]:
+    """Expected phoneme tokens per word from ONE espeak call for the whole
+    passage. Per-word calls cost ~25 ms each — 4+ s for a 200-word passage,
+    which stalled the first reader update while the text cache was cold.
+    Falls back to per-word calls if espeak's word chunking doesn't line up
+    1:1 with the word list.
+    """
+    out = phonemize(
+        " ".join(words),
+        language="en-us",
+        backend="espeak",
+        separator=_phone_sep,
+        strip=True,
+    )
+    chunks = normalize_ipa(out).split(" ")
+    if len(chunks) != len(words):
+        return [_phonemize_word(w) for w in words]
+    return [[tok for tok in chunk.split("|") if tok] for chunk in chunks]
 
 
 def _subst_cost(a: str, b: str) -> float:
@@ -159,12 +190,21 @@ def _positional_cost(
 
 
 def _align(
-    expected: list[str], actual: list[str], alts: dict[int, list[str]] | None = None
+    expected: list[str],
+    actual: list[str],
+    alts: dict[int, list[str]] | None = None,
+    del_cost: float = _DP_DEL,
 ) -> list[tuple[int | None, int | None]]:
     """Levenshtein-style DP alignment of phoneme token sequences.
 
     Substitution cost is panphon feature edit distance (minimized over
-    function-word alternates in `alts`); insertion/deletion cost is 1.
+    function-word alternates in `alts`, thresholded — see _dp_subst);
+    insertion cost is _DP_INS, deletion cost is del_cost. Cheap deletion
+    (the default) is right for SEARCHING (frontier/window finding over mostly
+    unread text); scoring the reached region uses del_cost=1.0 instead, so
+    short function words aren't gapped away — their phonemes bleed into
+    neighbors in connected speech, and with cheap deletion the DP would
+    rather delete "the" (0.5) than attribute the neighboring tokens to it.
     Returns a list of (expected_idx | None, actual_idx | None) pairs in
     sequence order.
     """
@@ -173,13 +213,13 @@ def _align(
     cost = [[_dp_subst(_positional_cost(i, expected, alts, actual[j])) for j in range(m)] for i in range(n)]
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
-        dp[i][0] = i * _DP_DEL
+        dp[i][0] = i * del_cost
     for j in range(1, m + 1):
         dp[0][j] = j * _DP_INS
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             dp[i][j] = min(
-                dp[i - 1][j] + _DP_DEL,
+                dp[i - 1][j] + del_cost,
                 dp[i][j - 1] + _DP_INS,
                 dp[i - 1][j - 1] + cost[i - 1][j - 1],
             )
@@ -190,7 +230,7 @@ def _align(
         # deleting expected tokens (moving up without consuming actual), so
         # with repeated content the actual speech anchors to the first
         # occurrence, not the last.
-        if i > 0 and dp[i][j] == dp[i - 1][j] + _DP_DEL:
+        if i > 0 and dp[i][j] == dp[i - 1][j] + del_cost:
             pairs.append((i - 1, None))
             i -= 1
         elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + cost[i - 1][j - 1]:
@@ -214,7 +254,7 @@ def _expected_for(text: str) -> tuple[list[str], list[list[str]], list[str], dic
 @lru_cache(maxsize=32)
 def _expected_cached(text: str):
     words = _WORD_RE.findall(text)
-    word_tokens = [_phonemize_word(w) for w in words]
+    word_tokens = _phonemize_words(words)
     expected_tokens = [t for toks in word_tokens for t in toks]
 
     # Register function-word alternates position-wise (only when the
@@ -439,8 +479,16 @@ def score(text: str, actual_ipa: str) -> dict:
     fit_cutoff = 0 if k == 0 else owner[k - 1] + 1
     end_tok = sum(len(t) for t in word_tokens[:fit_cutoff])
 
-    # Pass 2 — global alignment within the reached region only.
-    pairs = _align(expected_tokens[:end_tok], actual_tokens, alts) if end_tok else []
+    # Pass 2 — global alignment within the reached region only, with FULL
+    # deletion cost: there is no unread tail to smear into anymore, and
+    # expensive deletion keeps short function words ("the", "of", "or")
+    # attributed — connected speech bleeds their phonemes into neighbors, and
+    # cheap deletion would gap them to "not said" even though they were read.
+    pairs = (
+        _align(expected_tokens[:end_tok], actual_tokens, alts, del_cost=1.0)
+        if end_tok
+        else []
+    )
 
     # Frontier walk: a word is SAID when enough of its phonemes matched well,
     # and reading is sequential — a said word extends the reached region only

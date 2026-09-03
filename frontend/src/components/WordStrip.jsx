@@ -11,14 +11,14 @@ import { useEffect, useRef } from 'react';
 // recording, and interrupting a native smooth-scroll that often makes the
 // browser restart the animation endlessly — the strip looks frozen, then
 // teleports. A composited transform transition simply retargets mid-flight.
-export default function WordStrip({ words, currentIndex }) {
+export default function WordStrip({ words, currentIndex, loading }) {
   const stripRef = useRef(null);
   const trackRef = useRef(null);
 
   useEffect(() => {
     const strip = stripRef.current;
     const track = trackRef.current;
-    if (!strip || !track || words.length === 0) return;
+    if (!strip || !track || loading || words.length === 0) return;
     const p = Math.min(Math.max(currentIndex, 0), words.length - 1);
     const i0 = Math.floor(p);
     const i1 = Math.min(i0 + 1, words.length - 1);
@@ -29,21 +29,30 @@ export default function WordStrip({ words, currentIndex }) {
     if (!e0 || !e1) return;
     const wordCenter = center(e0) + (center(e1) - center(e0)) * frac;
     track.style.transform = `translateX(${strip.clientWidth / 2 - wordCenter}px)`;
-  }, [currentIndex, words.length]);
+  }, [currentIndex, words.length, loading]);
 
   const current = Math.floor(currentIndex);
   return (
     <div className="word-strip" ref={stripRef} aria-label="Reading progress">
-      <div className="word-strip-track" ref={trackRef}>
-        {words.map((w, i) => (
-          <span
-            key={i}
-            className={`strip-word ${i < current ? 'spoken' : ''} ${i === current ? 'current' : ''}`}
-          >
-            {w}
-          </span>
-        ))}
-      </div>
+      {loading ? (
+        <p className="strip-loading" aria-live="polite">
+          <span className="loading-dot" aria-hidden="true" />
+          <span className="loading-dot" aria-hidden="true" />
+          <span className="loading-dot" aria-hidden="true" />
+          <span>warming up your words…</span>
+        </p>
+      ) : (
+        <div className="word-strip-track" ref={trackRef}>
+          {words.map((w, i) => (
+            <span
+              key={i}
+              className={`strip-word ${i < current ? 'spoken' : ''} ${i === current ? 'current' : ''}`}
+            >
+              {w}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

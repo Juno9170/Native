@@ -66,8 +66,14 @@ export default function Home() {
         {busy ? (
           // wordIndex is fractional progress (12.5 = halfway through word
           // 12): the strip highlights the word being read and slides
-          // continuously; already-read words trail behind in stone.
-          <WordStrip words={wordList} currentIndex={wordIndex} />
+          // continuously; already-read words trail behind in stone. Until
+          // the first word is underlined the reader isn't live yet — show
+          // the warm-up state instead.
+          <WordStrip
+            words={wordList}
+            currentIndex={wordIndex}
+            loading={status === 'connecting' || wordIndex < 0}
+          />
         ) : (
           <>
             <textarea
