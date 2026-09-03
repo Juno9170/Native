@@ -11,8 +11,8 @@ services:
     environment:
       PORT: "8080"
       INFERENCE_URL: http://inference:9000
-    expose:
-      - "8080"
+    ports:
+      - "8080:8080" # host access for the Vite dev server's /ws proxy
     depends_on:
       - inference
 

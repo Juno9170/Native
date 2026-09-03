@@ -141,6 +141,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log:    slog.With("session", id, "remote", r.RemoteAddr),
 	}
 	s.lastIdx.Store(-1)
+	s.chunkIdx.Store(-1)
 	s.run()
 }
 
@@ -156,6 +157,11 @@ type session struct {
 	// lastIdx is the reader position (last matched word), shared by the
 	// chunk and peek workers; only ever advances.
 	lastIdx atomic.Int32
+	// chunkIdx is the chunk-confirmed position (prefix-fitted cumulative
+	// transcript — the ground truth). Chunks reset lastIdx to it, even
+	// backward: that's how a run-ahead reader recalibrates. Peeks may run
+	// at most 12 words ahead of it.
+	chunkIdx atomic.Int32
 	// lastAudioAt is the last time an audio frame arrived (unixnano),
 	// read by the idle watcher.
 	lastAudioAt atomic.Int64
@@ -474,7 +480,8 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 			ProcessedSec: float64(processed) / bytesPerSecond,
 		}
 		// Reader progress: align the cumulative transcription against the
-		// passage. Non-fatal — a failed align just omits wordIndex.
+		// passage. Chunks are the ground truth: they reset the position even
+		// BACKWARD, recalibrating a run-ahead reader every ~2.5 s.
 		if ipa != "" {
 			if cumulative.Len() > 0 {
 				cumulative.WriteString(" ")
@@ -482,8 +489,13 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 			cumulative.WriteString(ipa)
 			if idx, err := s.infer.Align(s.ctx, text, cumulative.String()); err != nil {
 				s.log.Warn("align failed", "err", err)
-			} else if s.advanceIdx(idx) {
+			} else if idx >= 0 {
+				s.chunkIdx.Store(int32(idx))
+				s.lastIdx.Store(int32(idx))
 				msg.WordIndex = &idx
+				if idx == s.wordCount-1 {
+					s.finishOnce.Do(func() { go s.autoFinish(700 * time.Millisecond) })
+				}
 			}
 		}
 		err = s.writeJSON(msg)
@@ -518,12 +530,14 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		if p.whole {
 			idx, err = s.infer.Align(s.ctx, text, ipa)
 		} else {
-			// A reader realistically skips at most 1-2 words between updates
-			// (peeks fire every ~0.33 s); cap at +3 so a duplicate word later
-			// in the passage can never teleport the strip.
-			cur := s.lastIdx.Load()
-			from := int(max(0, cur-3))
-			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, int(cur)+3)
+			// Caps: at most +3 past the current position per update (readers
+			// realistically skip <=2 words between 0.33s peeks), and at most
+			// 12 words ahead of the last chunk-confirmed position, so peeks
+			// can't drift arbitrarily far from ground truth.
+			cur := int(s.lastIdx.Load())
+			maxW := min(cur+3, int(s.chunkIdx.Load())+12)
+			from := max(0, cur-3)
+			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, maxW)
 		}
 		if err != nil {
 			s.log.Warn("peek align failed", "err", err)

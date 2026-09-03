@@ -138,12 +138,13 @@ export function usePronunciationSession() {
         case 'partial':
           setPartials((p) => [...p, msg]);
           if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
-            setWordIndex((cur) => Math.max(cur, msg.wordIndex));
+            // Chunk alignments are ground truth and may recalibrate BACKWARD
+            // to fix a run-ahead reader.
+            setWordIndex(msg.wordIndex);
           }
           break;
         case 'progress':
-          // Both frame kinds only ever advance the strip — backward motion
-          // reads as glitching.
+          // Peek alignments are hints: never move the strip backward.
           if (typeof msg.wordIndex === 'number' && msg.wordIndex >= 0) {
             setWordIndex((cur) => Math.max(cur, msg.wordIndex));
           }

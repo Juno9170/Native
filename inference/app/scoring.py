@@ -17,10 +17,11 @@ panphon feature edit distance between the two aligned tokens (indel cost 1).
 Scores are normalized to 0..1: score = 1 - dist / region, clamped at 0, where
 1 means identical.
 
-Partial runs: expected tokens past the last aligned one are unreached words
-(stopped early) and their deletions are free; `region` is max(tokens up to
-the last match, actual tokens, 1). Skipped words inside the reached region
-still cost. If nothing matched at all, the overall score is 0.
+Partial runs: a word counts as said only if enough of its phonemes matched
+well (>= min(tokens, 2) matches at cost <= 0.5). Reading ends at the first
+run of >=3 consecutive unsaid words — expected tokens past that cutoff are
+free (stopped early), while skipped words inside the reached region still
+cost. If nothing was reached at all, the overall score is 0.
 """
 
 import re
@@ -148,12 +149,16 @@ def _align(
     pairs: list[tuple[int | None, int | None]] = []
     i, j = n, m
     while i > 0 or j > 0:
-        if i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + cost[i - 1][j - 1]:
-            pairs.append((i - 1, j - 1))
-            i, j = i - 1, j - 1
-        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1.0:
+        # Tie-break toward the EARLIEST consistent match: on ties prefer
+        # deleting expected tokens (moving up without consuming actual), so
+        # with repeated content the actual speech anchors to the first
+        # occurrence, not the last.
+        if i > 0 and dp[i][j] == dp[i - 1][j] + 1.0:
             pairs.append((i - 1, None))
             i -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + cost[i - 1][j - 1]:
+            pairs.append((i - 1, j - 1))
+            i, j = i - 1, j - 1
         else:
             pairs.append((None, j - 1))
             j -= 1
@@ -338,19 +343,46 @@ def score(text: str, actual_ipa: str) -> dict:
 
     pairs = _align(expected_tokens, actual_tokens, alts)
 
-    # Partial runs: expected tokens past the last matched one are words the
-    # user never reached (stopped early) — their deletions are free. Skipped
-    # words *within* the reached region still cost. The score denominator is
-    # the compared region, not the full passage.
-    last_matched = -1
-    for e, a in pairs:
-        if e is not None and a is not None:
-            last_matched = max(last_matched, e)
-
     # Expected-token index -> owning word index.
     owner: list[int] = []
     for wi, toks in enumerate(word_tokens):
         owner.extend([wi] * len(toks))
+
+    # Run-end detection. "last matched token" alone is unreliable on long
+    # passages: lenient substitution costs spuriously match a few tokens near
+    # the end, marking unread words as reached. Instead, a word is UNSAID
+    # when almost none of its expected phonemes matched well, and reading is
+    # over at the first unsaid word followed by a (>=3-word) suffix with at
+    # most one said word in it — a reader realistically skips 1-2 words, so
+    # a long quiet tail means "stopped here". Expected tokens past the cutoff
+    # are free (stopped early); unsaid words within the reached region still
+    # cost (skipped mid-run).
+    good = [0] * len(words)  # good (low-cost) matches per word
+    for e, a in pairs:
+        if e is not None and a is not None and _positional_cost(
+            e, expected_tokens, alts, actual_tokens[a]
+        ) <= 0.5:
+            good[owner[e]] += 1
+
+    def said(wi: int) -> bool:
+        return good[wi] >= min(len(word_tokens[wi]), 2)
+
+    said_mask = [said(wi) for wi in range(len(words))]
+    # Reading is over at the first unsaid word whose suffix (>=3 words long)
+    # contains at most one said word — a reader realistically skips 1-2 words,
+    # so a long unsaid tail means "stopped here", and one said word in it is
+    # tolerated as a spurious late match. Fallback for short tails: cutoff
+    # right after the last said word.
+    cutoff = len(words)
+    for c in range(len(words) - 2):
+        if not said_mask[c] and sum(said_mask[c:]) <= 1:
+            cutoff = c
+            break
+    if cutoff == len(words) and not all(said_mask):
+        last_said = max((wi for wi, s in enumerate(said_mask) if s), default=-1)
+        cutoff = last_said + 1
+    # Token index of the end of the last reached word (-1 if none reached).
+    last_tok = sum(len(t) for t in word_tokens[:cutoff]) - 1
 
     total_dist = 0.0
     word_dist = [0.0] * len(words)
@@ -361,8 +393,8 @@ def score(text: str, actual_ipa: str) -> dict:
             # attributed to any word (word boundaries are ambiguous there).
             total_dist += 1.0
             continue
-        if a is None and e > last_matched:
-            continue  # unreached word, free
+        if a is None and e > last_tok:
+            continue  # past the cutoff: unreached word, free
         wi = owner[e]
         if a is None:
             c = 1.0
@@ -372,9 +404,14 @@ def score(text: str, actual_ipa: str) -> dict:
         total_dist += c
         word_dist[wi] += c
 
-    denom = max(last_matched + 1, len(actual_tokens), 1)
-    # Nothing matched at all (silence, noise) -> 0, not a free 1.0.
-    overall = 0.0 if last_matched < 0 else max(0.0, 1.0 - total_dist / denom)
+    # Words past the cutoff are "not said": no attribution, score 0.
+    for wi in range(cutoff, len(words)):
+        word_actual[wi] = []
+        word_dist[wi] = 0.0
+
+    denom = max(last_tok + 1, len(actual_tokens), 1)
+    # Nothing reached at all (silence, noise) -> 0, not a free 1.0.
+    overall = 0.0 if last_tok < 0 else max(0.0, 1.0 - total_dist / denom)
 
     out_words = []
     for w, toks, d, acts in zip(words, word_tokens, word_dist, word_actual):
