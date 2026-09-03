@@ -476,7 +476,9 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 	processed := 0
 	var cumulative strings.Builder
 	for j := range jobs {
+		t0 := time.Now()
 		ipa, err := s.infer.Transcribe(s.ctx, j.pcm)
+		trMs := time.Since(t0).Milliseconds()
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return // session already torn down
@@ -499,9 +501,11 @@ func (s *session) chunkWorker(jobs <-chan job, wg *sync.WaitGroup, text string) 
 				cumulative.WriteString(" ")
 			}
 			cumulative.WriteString(ipa)
+			tA := time.Now()
 			if idx, err := s.infer.Align(s.ctx, text, cumulative.String(), int(s.chunkIdx.Load())+chunkStep); err != nil {
 				s.log.Warn("align failed", "err", err)
 			} else if idx >= 0 {
+				s.log.Info("chunk", "transcribeMs", trMs, "alignMs", time.Since(tA).Milliseconds(), "idx", idx, "prev", s.chunkIdx.Load())
 				s.chunkIdx.Store(int32(idx))
 				s.lastIdx.Store(int32(idx))
 				msg.WordIndex = &idx
@@ -530,7 +534,9 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 	defer wg.Done()
 	prevJump := -1 // last peek answer beyond a single step; -1 = none pending
 	for p := range peeks {
+		t0 := time.Now()
 		ipa, err := s.infer.TranscribeFast(s.ctx, p.pcm)
+		trMs := time.Since(t0).Milliseconds()
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return // session already torn down
@@ -546,6 +552,7 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		// very start, where the window is the whole recording so far and
 		// prefix fitting is exactly right (and can't float forward).
 		var idx int
+		tA := time.Now()
 		if p.whole {
 			idx, err = s.infer.Align(s.ctx, text, ipa, int(s.chunkIdx.Load())+chunkStep)
 		} else {
@@ -564,6 +571,9 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 			s.log.Warn("peek align failed", "err", err)
 			continue
 		}
+		s.log.Info("peek", "whole", p.whole, "transcribeMs", trMs,
+			"alignMs", time.Since(tA).Milliseconds(), "ipaLen", len(ipa),
+			"idx", idx, "cur", s.lastIdx.Load(), "chunk", s.chunkIdx.Load())
 		if cur := int(s.lastIdx.Load()); idx > cur+1 {
 			if prevJump > cur {
 				// Second consecutive jump answer: apply the lower of the
