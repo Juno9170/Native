@@ -602,6 +602,10 @@ h3 {
   white-space: nowrap;
   padding: 0 50%; /* lets the first and last word reach center */
   width: max-content;
+  /* Positioned via translateX (see WordStrip.jsx): composited on the GPU and
+     safe to retarget mid-flight, unlike scrollIntoView smooth scrolling. */
+  transition: transform 0.3s ease-out;
+  will-change: transform;
 }
 
 .strip-word {
