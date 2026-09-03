@@ -18,8 +18,15 @@ Three services — see `PROTOCOL.md` for the wire contracts.
 
 ## Run
 
+Dev environment (Docker stack + Vite dev server on http://localhost:5173):
+
+```bash
+./dev.sh        # or double-click dev.bat on Windows
+./dev.sh stop   # shut everything down
+```
+
 Requires Docker with the NVIDIA container toolkit for GPU (falls back to CPU
-without the `deploy` section).
+without the `deploy` section). For the production build instead:
 
 ```bash
 docker compose up --build
