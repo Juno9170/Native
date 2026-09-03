@@ -240,7 +240,8 @@ def align_progress(text: str, actual_ipa: str) -> int:
 
 
 def locate_window(
-    text: str, actual_ipa: str, from_word: int, span: int = 25
+    text: str, actual_ipa: str, from_word: int, span: int = 25,
+    max_word: int | None = None,
 ) -> int:
     """Reader position from a short trailing audio window (a "peek").
 
@@ -250,6 +251,11 @@ def locate_window(
     matched region may start anywhere in the band, and the answer is the END
     of the best-matching region. Returns the 0-based word index, or -1 when
     the match is too poor to trust (silence/noise hallucinations).
+
+    max_word is a hard cap on the answer. A reader realistically skips at
+    most 1-2 words between updates, so a match ending further ahead is always
+    a duplicate-word coincidence, never intentional — such regions are
+    excluded from candidacy outright (not just penalized).
 
     Raises ValueError if the text contains no scoreable words.
     """
@@ -278,7 +284,14 @@ def locate_window(
     # places in the band, so region selection adds a small drift penalty per
     # token of distance from the band start (0.02/token ≈ one phoneme
     # mismatch per 5 words) — enough to anchor the reader near the current
-    # position, far too small to override a genuine match.
+    # position, far too small to override a genuine match. Rows past max_word
+    # are still computed (the match may legitimately START there... no — the
+    # region END is the answer, so rows past the cap are simply never
+    # candidates).
+    owner: list[int] = []
+    for wi, toks in enumerate(word_tokens):
+        owner.extend([wi] * len(toks))
+
     m = len(actual_tokens)
     prev = [float(j) for j in range(m + 1)]  # virtual row before the band
     best_i, best_sel, best_raw = lo, float("inf"), float("inf")
@@ -294,6 +307,9 @@ def locate_window(
                 if c2 < c:
                     c = c2
             cur[j] = min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + c)
+        if max_word is not None and owner[i - 1] > max_word:
+            prev = cur
+            continue  # region ends past the skip cap: not a candidate
         sel = cur[m] + 0.02 * (i - lo)
         if sel < best_sel:
             best_sel, best_i, best_raw = sel, i, cur[m]
@@ -307,9 +323,6 @@ def locate_window(
     if best_i <= lo or best_raw > 0.30 * m:
         return -1
 
-    owner: list[int] = []
-    for wi, toks in enumerate(word_tokens):
-        owner.extend([wi] * len(toks))
     return owner[best_i - 1]
 
 

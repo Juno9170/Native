@@ -46,6 +46,15 @@ const (
 
 	// jobQueueDepth buffers pending transcribe jobs per connection.
 	jobQueueDepth = 8
+
+	// Idle handling: the read deadline ticks every idleTick of silence. Each
+	// tick fires a catch-up peek (the reader may lag at fast speech; once
+	// audio stops, no new peeks would fire otherwise). If the reader is
+	// within nearEndWords of the passage end, finishSilence of silence
+	// auto-finishes even without a last-word detection.
+	idleTick      = time.Second
+	finishSilence = 2500 * time.Millisecond
+	nearEndWords  = 3
 )
 
 var nextID atomic.Uint64
@@ -147,6 +156,9 @@ type session struct {
 	// lastIdx is the reader position (last matched word), shared by the
 	// chunk and peek workers; only ever advances.
 	lastIdx atomic.Int32
+	// lastAudioAt is the last time an audio frame arrived (unixnano),
+	// read by the idle watcher.
+	lastAudioAt atomic.Int64
 
 	wordCount  int
 	finishOnce sync.Once
@@ -191,16 +203,24 @@ func (s *session) run() {
 	buf := make([]byte, 0, chunkBytes*2)
 	chunkStart := 0
 	peekStart := 0
+	var bufMu sync.Mutex // read loop appends; idle watcher copies windows
+
+	// lastAudioAt drives the idle watcher (gorilla poisons a conn after ANY
+	// read error — even a deadline timeout — so idle detection can't live on
+	// the read deadline; it's a separate timer goroutine instead).
+	s.lastAudioAt.Store(time.Now().UnixNano())
+	idleDone := make(chan struct{})
+	idleStopped := make(chan struct{})
+	go s.idleWatcher(idleDone, idleStopped, &bufMu, &buf, peeks)
 
 readLoop:
 	for {
 		mt, data, err := s.conn.ReadMessage()
 		if err != nil {
 			if s.autoStop.Load() {
-				// autoFinish tripped the read deadline: the last word was
-				// detected and the grace period elapsed — finish exactly as
-				// if the client had sent "stop".
-				s.log.Info("auto-finished: last word detected")
+				// autoFinish tripped the read deadline: finish exactly as if
+				// the client had sent "stop".
+				s.log.Info("auto-finished", "lastIdx", s.lastIdx.Load())
 				break readLoop
 			}
 			if s.ctx.Err() == nil {
@@ -211,17 +231,22 @@ readLoop:
 		}
 		switch mt {
 		case websocket.BinaryMessage:
+			s.lastAudioAt.Store(time.Now().UnixNano())
+			bufMu.Lock()
 			if len(buf)+len(data) > maxAudioBytes {
+				bufMu.Unlock()
 				s.fail("maximum recording length exceeded (~3 minutes)")
 				break readLoop
 			}
 			buf = append(buf, data...)
 			if len(buf)-chunkStart >= chunkBytes {
-				if !s.enqueue(jobs, job{pcm: buf[chunkStart:]}) {
-					break readLoop
-				}
+				tail := append([]byte(nil), buf[chunkStart:]...)
 				chunkStart = len(buf)
 				peekStart = len(buf)
+				bufMu.Unlock()
+				if !s.enqueue(jobs, job{pcm: tail}) {
+					break readLoop
+				}
 			} else if len(buf)-peekStart >= peekEvery {
 				// Reader peek: trailing window only, position update only.
 				// Dropped (not queued) if the peek worker is behind — a stale
@@ -233,11 +258,14 @@ readLoop:
 				}
 				cp := make([]byte, len(buf)-start)
 				copy(cp, buf[start:])
+				peekStart = len(buf)
+				bufMu.Unlock()
 				select {
 				case peeks <- peekJob{pcm: cp, whole: whole}:
 				default:
 				}
-				peekStart = len(buf)
+			} else {
+				bufMu.Unlock()
 			}
 		case websocket.TextMessage:
 			var m clientMessage
@@ -249,6 +277,10 @@ readLoop:
 			break readLoop
 		}
 	}
+
+	// Stop the idle watcher before closing peeks (it may be about to send).
+	close(idleDone)
+	<-idleStopped
 
 	if s.ctx.Err() != nil {
 		// Session was cancelled (disconnect or fatal error); workers exit
@@ -303,6 +335,54 @@ readLoop:
 	s.closePolitely(websocket.CloseNormalClosure, "done")
 }
 
+// idleWatcher fires catch-up peeks when audio stops arriving, so the reader
+// can catch up to fast speech after it ends (peeks normally only fire on new
+// audio). Near the passage end, finishSilence of silence auto-finishes even
+// without a confident last-word detection. (Gorilla poisons a connection
+// after any read error — even a deadline timeout — so idle detection is this
+// timer goroutine, not a read deadline.)
+func (s *session) idleWatcher(done <-chan struct{}, stopped chan<- struct{}, bufMu *sync.Mutex, buf *[]byte, peeks chan<- peekJob) {
+	defer close(stopped)
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-tick.C:
+		}
+		idle := time.Since(time.Unix(0, s.lastAudioAt.Load()))
+		if idle < idleTick {
+			continue
+		}
+		if s.lastIdx.Load() < int32(s.wordCount-1) {
+			bufMu.Lock()
+			if len(*buf) > 0 {
+				start := len(*buf) - peekWindow
+				whole := start <= 0
+				if start < 0 {
+					start = 0
+				}
+				cp := make([]byte, len(*buf)-start)
+				copy(cp, (*buf)[start:])
+				select {
+				case peeks <- peekJob{pcm: cp, whole: whole}:
+				default:
+				}
+			}
+			bufMu.Unlock()
+		}
+		if idle >= finishSilence &&
+			s.lastIdx.Load() >= int32(s.wordCount-nearEndWords) {
+			// Near the end and speech stopped: finish even if the last word
+			// was never confidently detected.
+			s.finishOnce.Do(func() { go s.autoFinish(0) })
+		}
+	}
+}
+
 // awaitStart reads until a valid {"type":"start","text":...} arrives.
 func (s *session) awaitStart() (string, bool) {
 	for {
@@ -342,25 +422,28 @@ func (s *session) advanceIdx(idx int) bool {
 		}
 		if s.lastIdx.CompareAndSwap(cur, int32(idx)) {
 			if idx == s.wordCount-1 {
-				s.finishOnce.Do(func() { go s.autoFinish() })
+				s.finishOnce.Do(func() { go s.autoFinish(700 * time.Millisecond) })
 			}
 			return true
 		}
 	}
 }
 
-// autoFinish ends the session shortly after the last word is detected. The
-// word is already in the buffer (that's how it was detected); a short grace
-// period captures its tail, then we notify the client and interrupt the
-// read loop via the read deadline (a blocked ReadMessage can't otherwise be
-// interrupted without closing the conn, which we still need for "final").
-func (s *session) autoFinish() {
-	select {
-	case <-time.After(700 * time.Millisecond):
-	case <-s.ctx.Done():
-		return
+// autoFinish ends the session after the last word is detected (or, with
+// grace 0, when speech stops near the passage end). The final word is already
+// in the buffer (that's how it was detected); the grace period captures its
+// tail. We notify the client, then interrupt the read loop via the read
+// deadline (a blocked ReadMessage can't otherwise be interrupted without
+// closing the conn, which we still need for "final").
+func (s *session) autoFinish(grace time.Duration) {
+	if grace > 0 {
+		select {
+		case <-time.After(grace):
+		case <-s.ctx.Done():
+			return
+		}
 	}
-	s.log.Info("last word detected, finishing")
+	s.log.Info("finishing session", "grace", grace)
 	if err := s.writeJSON(map[string]string{"type": "finishing"}); err != nil {
 		return
 	}
@@ -435,8 +518,12 @@ func (s *session) peekWorker(peeks <-chan peekJob, wg *sync.WaitGroup, text stri
 		if p.whole {
 			idx, err = s.infer.Align(s.ctx, text, ipa)
 		} else {
-			from := int(max(0, s.lastIdx.Load()-3))
-			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from)
+			// A reader realistically skips at most 1-2 words between updates
+			// (peeks fire every ~0.33 s); cap at +3 so a duplicate word later
+			// in the passage can never teleport the strip.
+			cur := s.lastIdx.Load()
+			from := int(max(0, cur-3))
+			idx, err = s.infer.AlignWindow(s.ctx, text, ipa, from, int(cur)+3)
 		}
 		if err != nil {
 			s.log.Warn("peek align failed", "err", err)

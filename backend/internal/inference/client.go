@@ -149,13 +149,15 @@ func (c *Client) Align(ctx context.Context, text, actualIPA string) (int, error)
 }
 
 // AlignWindow is mode "window": actualIPA is a short trailing window, aligned
-// locally against the band of words starting at fromWord.
-func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWord int) (int, error) {
+// locally against the band of words starting at fromWord, never answering
+// beyond maxWord (a further match is always a duplicate-word coincidence).
+func (c *Client) AlignWindow(ctx context.Context, text, actualIPA string, fromWord, maxWord int) (int, error) {
 	return c.align(ctx, map[string]any{
 		"text":      text,
 		"actualIpa": actualIPA,
 		"mode":      "window",
 		"fromWord":  fromWord,
+		"maxWord":   maxWord,
 	})
 }
 
