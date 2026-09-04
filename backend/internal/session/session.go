@@ -109,11 +109,12 @@ type peekJob struct {
 }
 
 type finalMessage struct {
-	Type        string                 `json:"type"`
-	IPA         string                 `json:"ipa"`
-	ExpectedIPA string                 `json:"expectedIpa"`
-	Score       float64                `json:"score"`
-	Words       []inference.WordResult `json:"words"`
+	Type        string                  `json:"type"`
+	IPA         string                  `json:"ipa"`
+	ExpectedIPA string                  `json:"expectedIpa"`
+	Score       float64                 `json:"score"`
+	Words       []inference.WordResult  `json:"words"`
+	Accent      *inference.AccentResult `json:"accent,omitempty"`
 }
 
 type errorMessage struct {
@@ -343,12 +344,21 @@ readLoop:
 	}
 	buf = nil // discard the audio buffer
 
+	// Accent classification is best-effort: untrained classifier or too
+	// little speech must never sink an otherwise-good result.
+	acc, err := s.infer.ClassifyAccent(s.ctx, text, fullIPA)
+	if err != nil {
+		s.log.Warn("accent classification failed", "err", err)
+		acc = nil
+	}
+
 	if err := s.writeJSON(finalMessage{
 		Type:        "final",
 		IPA:         fullIPA,
 		ExpectedIPA: score.ExpectedIPA,
 		Score:       score.Score,
 		Words:       score.Words,
+		Accent:      acc,
 	}); err != nil {
 		return
 	}

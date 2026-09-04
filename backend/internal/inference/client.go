@@ -34,6 +34,16 @@ type ScoreResponse struct {
 	Words       []WordResult `json:"words"`
 }
 
+// AccentResult mirrors POST /classify-accent on the inference service.
+type AccentResult struct {
+	Accent     string  `json:"accent"`
+	Confidence float64 `json:"confidence"`
+	Strength   struct {
+		Level string  `json:"level"`
+		Score float64 `json:"score"`
+	} `json:"strength"`
+}
+
 // Client calls the inference service over HTTP.
 type Client struct {
 	base string
@@ -133,6 +143,42 @@ func (c *Client) Score(ctx context.Context, text, actualIPA string) (*ScoreRespo
 	var out ScoreResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decoding /score response: %w", err)
+	}
+	return &out, nil
+}
+
+// ClassifyAccent posts the reference text and actual IPA to /classify-accent.
+// Returns (nil, nil) when the classifier isn't trained yet (503) — accent is
+// an optional extra, never fatal for a session.
+func (c *Client) ClassifyAccent(ctx context.Context, text, actualIPA string) (*AccentResult, error) {
+	payload, err := json.Marshal(map[string]string{
+		"text":      text,
+		"actualIpa": actualIPA,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/classify-accent", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("inference /classify-accent returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var out AccentResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decoding /classify-accent response: %w", err)
 	}
 	return &out, nil
 }

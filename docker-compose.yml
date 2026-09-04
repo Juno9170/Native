@@ -25,6 +25,9 @@ services:
       - "9000"
     volumes:
       - hf-cache:/root/.cache/huggingface
+      # Training assets (SAA dataset, accent-classifier checkpoint). The
+      # /classify-accent endpoint is disabled when no checkpoint exists here.
+      - ./inference/training:/training
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 5s

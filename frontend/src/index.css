@@ -418,6 +418,63 @@ h3 {
   font-size: 1.4rem;
 }
 
+.accent-card {
+  background: var(--cream);
+  border: 2px solid var(--sand);
+  border-radius: var(--radius-card-alt);
+  padding: 0.9rem 1.1rem;
+  margin: 0 auto 0.25rem;
+  max-width: 420px;
+}
+
+.accent-card h3 {
+  margin: 0 0 0.35rem;
+}
+
+.accent-line {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.accent-name {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  color: var(--saddle);
+  text-transform: capitalize;
+}
+
+.accent-meta {
+  color: var(--stone);
+  font-size: 0.9rem;
+}
+
+.accent-meter {
+  height: 8px;
+  margin-top: 0.6rem;
+  background: var(--sand);
+  border-radius: 999px 700px 999px 800px;
+  overflow: hidden;
+}
+
+.accent-meter-fill {
+  height: 100%;
+  background: var(--olive);
+  border-radius: inherit;
+  transition: width 0.9s var(--ease-natural);
+}
+
+.accent-meter-fill.moderate {
+  background: var(--rust);
+}
+
+.accent-meter-fill.strong {
+  background: var(--saddle);
+}
+
 .ipa-compare {
   display: grid;
   grid-template-columns: 1fr 1fr;

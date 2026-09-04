@@ -19,6 +19,25 @@ export default function Results({ result, onReset }) {
 
       <Gauge score={result.score ?? 0} />
 
+      {result.accent && (
+        <div className="accent-card">
+          <h3>Accent</h3>
+          <p className="accent-line">
+            <span className="accent-name">{result.accent.accent}</span>
+            <span className="accent-meta">
+              {Math.round((result.accent.confidence ?? 0) * 100)}% match ·{' '}
+              {result.accent.strength?.level ?? '—'} accent
+            </span>
+          </p>
+          <div className="accent-meter" title="accent strength">
+            <div
+              className={`accent-meter-fill ${result.accent.strength?.level ?? ''}`}
+              style={{ width: `${Math.round((result.accent.strength?.score ?? 0) * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       <div className="ipa-compare">
         <div className="ipa-block">
           <h3>Expected</h3>

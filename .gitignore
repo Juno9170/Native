@@ -11,3 +11,5 @@ graphify-out/
 # AI tooling — never committed (house rule)
 AGENTS.md
 .kimi-code/
+inference/training/data/
+inference/training/features.jsonl

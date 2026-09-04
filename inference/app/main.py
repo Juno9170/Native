@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from . import scoring, transcribe
+from . import accent, scoring, transcribe
 
 
 @asynccontextmanager
@@ -64,6 +64,44 @@ def score_ep(req: ScoreRequest) -> dict:
         return scoring.score(req.text, req.actualIpa)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/classify-accent")
+def classify_accent_ep(req: ScoreRequest) -> dict:
+    """Accent type + strength from the deviation sequence between the
+    expected IPA (espeak, from req.text) and the actual IPA (req.actualIpa).
+    Same request shape as /score. 503 until a trained checkpoint exists."""
+    clf = accent.get_classifier()
+    if clf is None:
+        raise HTTPException(
+            status_code=503, detail="accent classifier not trained yet"
+        )
+    try:
+        _, _, expected_tokens, alts = scoring._expected_for(req.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    actual_tokens = scoring.normalize_ipa(req.actualIpa).split()
+    if len(actual_tokens) < 10:
+        raise HTTPException(status_code=400, detail="not enough speech to classify")
+    pairs = scoring._align(expected_tokens, actual_tokens, alts, del_cost=1.0)
+    tokens = accent.pairs_to_tokens(
+        pairs, expected_tokens, actual_tokens, alts, scoring._positional_cost
+    )
+    costs, n_ins, n_del = [], 0, 0
+    for e, a in pairs:
+        if e is not None and a is not None:
+            costs.append(scoring._positional_cost(e, expected_tokens, alts, actual_tokens[a]))
+        elif e is not None:
+            n_del += 1
+        else:
+            n_ins += 1
+    n = max(len(pairs), 1)
+    return clf.classify_tokens(
+        tokens,
+        sum(costs) / len(costs) if costs else 1.0,
+        n_ins / n,
+        n_del / n,
+    )
 
 
 class AlignRequest(BaseModel):
